@@ -16,7 +16,11 @@ const EDIT_LOCK_TTL = 30000;
 const DYN_ROUTE_SAMPLE_SEC = 5;
 const COMBAT_TICK = 30;
 
-const MQTT_URI = 'wss://broker.hivemq.com:8884/mqtt';
+const MQTT_BROKERS = [
+  { name: 'EMQX',      uri: 'wss://broker.emqx.io:8084/mqtt' },
+  { name: 'HiveMQ',    uri: 'wss://broker.hivemq.com:8884/mqtt' },
+  { name: 'Mosquitto', uri: 'wss://test.mosquitto.org:8081/mqtt' },
+];
 const TOPIC_PREFIX = 'slg_sandtable/room/';
 const PERCENT_OPTIONS = [0, 17, 33, 50, 67, 84, 100];
 
@@ -342,22 +346,51 @@ let heartbeatTimer = null, hostCheckTimer = null, pingTimer = null, reconnectTim
 let lockGCTimer = null, lockRenewTimer = null;
 const isConnected = () => state.connected && !!client;
 
+let currentBrokerIndex = 0;
+let connectAttemptTimer = null;
+
 function connectMQTT(roomCode, asHost){
   if(!roomCode || roomCode.length!==6){ emit(EVT.DEBUG, {msg:'❌ 房間碼必須為6位數', err:true}); return; }
   if(!state.commanderName){ emit(EVT.DEBUG, {msg:'❌ 請先填寫指揮官名稱', err:true}); return; }
   if(client){ try{ client.disconnect(); }catch(e){} client = null; }
+  clearTimeout(connectAttemptTimer);
+
   state.roomCode = roomCode;
   state.myClientId = 'slg_' + uid();
   state.connecting = true; state.connected = false;
-  emit(EVT.CONN); emit(EVT.DEBUG, {msg:'🟡 正在連線至中繼伺服器...'});
-  const c = new Paho.MQTT.Client(MQTT_URI, state.myClientId);
+  emit(EVT.CONN);
+
+  const broker = MQTT_BROKERS[currentBrokerIndex];
+  emit(EVT.DEBUG, {msg:`🟡 嘗試連線至 ${broker.name}（${currentBrokerIndex + 1}/${MQTT_BROKERS.length}）...`});
+
+  const c = new Paho.MQTT.Client(broker.uri, state.myClientId);
   client = c;
-  c.onConnectionLost = resp => { state.connected = false; state.connecting = false; emit(EVT.CONN); emit(EVT.DEBUG, {msg:'🔴 連線中斷：'+(resp.errorCode||'unknown'), err:true}); scheduleReconnect(); };
+
+  // 10 秒連線超時保護
+  connectAttemptTimer = setTimeout(() => {
+    if(!state.connected && state.connecting){
+      emit(EVT.DEBUG, {msg:`⏱️ ${broker.name} 連線超時，切換至下一個 broker...`, err:true});
+      try{ c.disconnect(); }catch(e){}
+      tryNextBroker();
+    }
+  }, 10000);
+
+  c.onConnectionLost = resp => {
+    state.connected = false; state.connecting = false;
+    emit(EVT.CONN);
+    emit(EVT.DEBUG, {msg:'🔴 連線中斷：'+(resp.errorCode||'unknown'), err:true});
+    // 中斷時也嘗試切換 broker
+    tryNextBroker();
+  };
+
   c.onMessageArrived = msg => { try{ handleIncoming(JSON.parse(msg.payloadString)); }catch(e){ console.warn('訊息解析失敗', e); } };
+
   c.connect({
     onSuccess: () => {
+      clearTimeout(connectAttemptTimer);
       state.connected = true; state.connecting = false;
-      emit(EVT.CONN); emit(EVT.DEBUG, {msg:'🟢 成功連接中繼伺服器！'});
+      emit(EVT.CONN);
+      emit(EVT.DEBUG, {msg:`🟢 成功連接 ${broker.name}！`});
       c.subscribe(TOPIC_PREFIX + roomCode);
       if(asHost){ state.isHost = true; state.hostName = state.commanderName; state.roomEpoch = uid(); }
       else { state.isHost = false; state.hostName = ''; }
@@ -367,16 +400,45 @@ function connectMQTT(roomCode, asHost){
       if(state.isHost) setTimeout(() => publish(buildFullSnapshot()), 300);
       else publish({ type:'sync_request', clientId:state.myClientId, name:state.commanderName });
     },
-    onFailure: err => { state.connected = false; state.connecting = false; emit(EVT.CONN); emit(EVT.DEBUG, {msg:'🔴 連線失敗：'+(err.errorCode||'無法連接'), err:true}); scheduleReconnect(); },
-    keepAliveInterval:30, cleanSession:true, reconnect:true, timeout:10, useSSL:true,
+    onFailure: err => {
+      clearTimeout(connectAttemptTimer);
+      state.connected = false; state.connecting = false;
+      emit(EVT.CONN);
+      emit(EVT.DEBUG, {msg:`🔴 ${broker.name} 連線失敗：${err.errorCode||'無法連接'}`, err:true});
+      tryNextBroker();
+    },
+    keepAliveInterval: 30,
+    cleanSession: true,
+    reconnect: false,   // 我們自己控制重連，關閉 Paho 自動重連
+    timeout: 8,         // 8 秒連線超時
+    useSSL: true,
   });
+}
+
+function tryNextBroker(){
+  if(!state.roomCode) return;
+  if(!state.connecting && !state.connected && !state.isSimulating && !state.members) return;
+  currentBrokerIndex = (currentBrokerIndex + 1) % MQTT_BROKERS.length;
+  setTimeout(() => {
+    if(!state.connected && state.roomCode){
+      connectMQTT(state.roomCode, state.isHost);
+    }
+  }, 500);
 }
 function scheduleReconnect(){
   clearTimeout(reconnectTimer);
   if(!state.roomCode) return;
-  reconnectTimer = setTimeout(() => { if(!state.connected && state.roomCode){ emit(EVT.DEBUG, {msg:'🟡 嘗試重新連線...'}); connectMQTT(state.roomCode, state.isHost); } }, 3000);
+  reconnectTimer = setTimeout(() => {
+    if(!state.connected && state.roomCode){
+      // 換一個 broker 再試
+      currentBrokerIndex = (currentBrokerIndex + 1) % MQTT_BROKERS.length;
+      emit(EVT.DEBUG, {msg:'🟡 重新嘗試連線...'});
+      connectMQTT(state.roomCode, state.isHost);
+    }
+  }, 3000);
 }
 function disconnectMQTT(){
+  clearTimeout(connectAttemptTimer); 
   clearInterval(heartbeatTimer); clearInterval(hostCheckTimer); clearInterval(pingTimer);
   clearTimeout(reconnectTimer); clearInterval(lockGCTimer); clearInterval(lockRenewTimer);
   if(client){ try{ client.disconnect(); }catch(e){} client = null; }
@@ -2254,7 +2316,7 @@ const DEPLOY = (() => {
     return el;
   }
 
-  function renderGraphView(cities, conflictMap){
+    function renderGraphView(cities, conflictMap){
     const wrap = document.getElementById('deployTableWrap');
     const activeCities = cities.filter(c => {
       const hasOut = (c.attackTargets||[]).some(t => (t.preWarPercent||0)>0) || (c.defendTargets||[]).some(t => (t.preWarPercent||0)>0);
@@ -2295,6 +2357,7 @@ const DEPLOY = (() => {
 
     svg.appendChild(makeDefs(ns));
 
+    // 戰區框
     if (layoutMode === 'zone' && zones.length > 0){
       const zoneG = document.createElementNS(ns, 'g');
       zoneG.setAttribute('class', 'graph-zones');
@@ -2324,6 +2387,7 @@ const DEPLOY = (() => {
       svg.appendChild(zoneG);
     }
 
+    // 連線
     const edgesG = document.createElementNS(ns, 'g');
     edgesG.setAttribute('class', 'graph-edges');
 
@@ -2354,6 +2418,7 @@ const DEPLOY = (() => {
     }
     svg.appendChild(edgesG);
 
+    // 節點
     const nodesG = document.createElementNS(ns, 'g');
     nodesG.setAttribute('class', 'graph-nodes');
 
@@ -2362,11 +2427,14 @@ const DEPLOY = (() => {
       if (!pos) continue;
       const r = nodeRadius(c);
       const info = conflictMap.get(c.id) || { conflict: false, incoming: 0 };
+      const cIcon = allianceIconOf(c);
+      const hasIcon = !!cIcon;
 
       const g = document.createElementNS(ns, 'g');
       g.setAttribute('class', 'graph-node-group');
       g.dataset.cityId = c.id;
 
+      // 衝突光環
       if (info.conflict){
         const halo = document.createElementNS(ns, 'circle');
         halo.setAttribute('cx', pos.x);
@@ -2386,8 +2454,21 @@ const DEPLOY = (() => {
         g.appendChild(halo);
       }
 
+      // 節點底層形狀（依 side：圓/方/三角/菱/六邊）
       g.appendChild(makeNodeShape(ns, c.side, pos.x, pos.y, r));
 
+      // 有盟徽 → 加一層深色底盤讓 emoji 更清楚
+      if (hasIcon){
+        const bg = document.createElementNS(ns, 'circle');
+        bg.setAttribute('cx', pos.x);
+        bg.setAttribute('cy', pos.y);
+        bg.setAttribute('r', r * 0.82);
+        bg.setAttribute('fill', 'rgba(0,0,0,0.55)');
+        bg.setAttribute('pointer-events', 'none');
+        g.appendChild(bg);
+      }
+
+      // 首都皇冠
       if (c.isCapital){
         const crown = document.createElementNS(ns, 'text');
         crown.setAttribute('x', pos.x);
@@ -2398,34 +2479,52 @@ const DEPLOY = (() => {
         g.appendChild(crown);
       }
 
+      // 節點中央：有盟徽 → 顯示 emoji；否則 → 顯示兵力數字
+      if (hasIcon){
+        const iconText = document.createElementNS(ns, 'text');
+        iconText.setAttribute('x', pos.x);
+        iconText.setAttribute('y', pos.y);
+        iconText.setAttribute('text-anchor', 'middle');
+        iconText.setAttribute('dominant-baseline', 'central');
+        iconText.setAttribute('font-size', r * 1.15);
+        iconText.setAttribute('font-family', '"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif');
+        iconText.setAttribute('pointer-events', 'none');
+        iconText.textContent = cIcon;
+        g.appendChild(iconText);
+      } else {
+        const numLabel = document.createElementNS(ns, 'text');
+        numLabel.setAttribute('x', pos.x);
+        numLabel.setAttribute('y', pos.y + 4);
+        numLabel.setAttribute('text-anchor', 'middle');
+        numLabel.setAttribute('font-size', Math.min(11, r * 0.7));
+        numLabel.setAttribute('font-weight', '700');
+        numLabel.setAttribute('fill', '#fff');
+        numLabel.setAttribute('pointer-events', 'none');
+        numLabel.textContent = c.totalTeams;
+        g.appendChild(numLabel);
+      }
+
+      // 名稱標籤（節點下方）
       const label = document.createElementNS(ns, 'text');
       label.setAttribute('class', 'graph-node-label' + (c.name.length > 4 ? ' small' : ''));
       label.setAttribute('x', pos.x);
       label.setAttribute('y', pos.y + r + 16);
-      const cIcon = allianceIconOf(c);
-      label.textContent = (cIcon ? cIcon + ' ' : '') + (c.name.length > 8 ? c.name.slice(0,8)+'…' : c.name);
+      // 有盟徽 → 名稱後面加「(兵力)」，因為中央被 emoji 佔用
+      // 沒盟徽 → 只顯示名稱
+      label.textContent = (c.name.length > 8 ? c.name.slice(0,8)+'…' : c.name) + (hasIcon ? ` (${c.totalTeams})` : '');
       g.appendChild(label);
-
-      const numLabel = document.createElementNS(ns, 'text');
-      numLabel.setAttribute('x', pos.x);
-      numLabel.setAttribute('y', pos.y + 4);
-      numLabel.setAttribute('text-anchor', 'middle');
-      numLabel.setAttribute('font-size', Math.min(11, r * 0.7));
-      numLabel.setAttribute('font-weight', '700');
-      numLabel.setAttribute('fill', '#fff');
-      numLabel.setAttribute('pointer-events', 'none');
-      numLabel.textContent = c.totalTeams;
-      g.appendChild(numLabel);
 
       nodesG.appendChild(g);
     }
     svg.appendChild(nodesG);
 
+    // 資訊面板
     const infoPanel = document.createElement('div');
     infoPanel.className = 'graph-info-panel';
     infoPanel.style.display = 'none';
     infoPanel.innerHTML = '<div class="title"></div><div class="body"></div>';
 
+    // 圖例
     const legend = document.createElement('div');
     legend.className = 'graph-legend';
     legend.innerHTML = `
@@ -2436,8 +2535,10 @@ const DEPLOY = (() => {
       <span><span class="dot" style="background:#a855f7;clip-path:polygon(50% 0, 93% 25%, 93% 75%, 50% 100%, 7% 75%, 7% 25%);"></span>NPC</span>
       <span><span class="line atk"></span>進攻</span>
       <span><span class="line def"></span>協防</span>
+      <span style="color:var(--text-dim);">★ 節點中央 = 盟徽</span>
     `;
 
+    // 縮放按鈕
     const zoomCtrl = document.createElement('div');
     zoomCtrl.className = 'graph-zoom';
     zoomCtrl.innerHTML = `
@@ -2455,6 +2556,7 @@ const DEPLOY = (() => {
     graphWrap.appendChild(zoomCtrl);
     wrap.appendChild(graphWrap);
 
+    // 縮放與平移
     let vb = { x: 0, y: 0, w: W, h: H };
     function applyVB(){ svg.setAttribute('viewBox', `${vb.x} ${vb.y} ${vb.w} ${vb.h}`); }
     zoomCtrl.querySelector('[data-zoom="in"]').addEventListener('click', () => {
@@ -2506,6 +2608,7 @@ const DEPLOY = (() => {
       applyVB();
     }, { passive: false });
 
+    // 懸停高亮
     const allNodeGroups = nodesG.querySelectorAll('.graph-node-group');
     const allEdges = edgesG.querySelectorAll('.graph-edge');
 
