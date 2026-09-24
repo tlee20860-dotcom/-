@@ -3,8 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>多戰區城戰沙盤推演與多人聯合作戰室 v7.3</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+<title>多戰區城戰沙盤推演與多人聯合作戰室 v7.4</title>
+<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-database-compat.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.4.4/lz-string.min.js"></script>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -26,7 +28,38 @@
 <!-- ============ 房間連線 ============ -->
 <section id="tab-room" class="tab-content active">
   <div class="card">
-    <div class="card-title">📡 聯合作戰連線</div>
+    <div class="card-title">📁 檔案協作（推薦）</div>
+    <div class="text-dim" style="margin-bottom:10px;">
+      ＊不需網路、不需伺服器。各自編輯後匯出檔案，用 LINE / Discord 傳給朋友合併。
+    </div>
+    <div class="flex-row">
+      <button class="btn btn-primary" id="btnExportJSON">📤 匯出沙盤檔案</button>
+      <button class="btn btn-success" id="btnImportJSON">📥 匯入沙盤檔案</button>
+    </div>
+    <input type="file" id="importFileInput" accept=".json" style="display:none;">
+    <div class="text-dim mt-8">
+      ＊「匯出」會下載一個 .json 檔案，包含所有同盟、戰區、城池資料。<br>
+      ＊「匯入」可選擇「覆蓋」或「合併」，合併時以匯入的資料為優先。
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">🔗 分享連結（適合小量資料）</div>
+    <div class="text-dim" style="margin-bottom:10px;">
+      ＊把整份沙盤壓縮成一串網址，複製後貼給朋友，他們打開即載入同一份資料。
+    </div>
+    <div class="flex-row">
+      <button class="btn btn-primary" id="btnGenerateShareLink">🔗 生成分享連結</button>
+      <button class="btn btn-ghost" id="btnCopyShareLink">📋 複製連結</button>
+    </div>
+    <input type="text" id="shareLinkDisplay" readonly placeholder="尚未生成" style="margin-top:8px;">
+    <div class="text-dim mt-8">
+      ＊資料量過大時連結會很長，若超過 8000 字元請改用「檔案協作」。
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">📡 Firebase 即時連線（進階）</div>
     <div class="param-item">
       <label>您的指揮官名稱</label>
       <input type="text" id="commanderName" placeholder="輸入名稱..." maxlength="12">
@@ -44,7 +77,6 @@
     </div>
     <div class="flex-row mt-8" style="justify-content:space-between;">
       <span class="health-indicator"><span class="health-dot red" id="healthDot"></span><span id="healthText">未連線</span></span>
-      <span class="text-dim" id="pingDisplay">延遲：--ms</span>
       <span class="text-dim" id="hostDisplay"></span>
     </div>
     <div class="debug-log mt-8" id="debugLog"></div>
@@ -83,12 +115,12 @@
         <div class="param-item">
           <label>每線每分鐘最小消耗隊數</label>
           <input type="number" id="globalConsumeMinPerMin" value="10" min="0" step="0.1">
-          <div class="param-hint">每條路線每分鐘可抽取的最小消耗值（戰力差距小時容易抽到此值）。</div>
+          <div class="param-hint">每條路線每分鐘可抽取的最小消耗值。</div>
         </div>
         <div class="param-item">
           <label>每線每分鐘最大消耗隊數</label>
           <input type="number" id="globalConsumeMaxPerMin" value="30" min="0" step="0.1">
-          <div class="param-hint">每條路線每分鐘可抽取的最大消耗值（戰力差距大時容易抽到此值）。</div>
+          <div class="param-hint">每條路線每分鐘可抽取的最大消耗值。</div>
         </div>
         <div class="param-item">
           <label>攻城效率</label>
@@ -104,12 +136,12 @@
         <div class="param-item">
           <label>最大戰敗比例（%）</label>
           <input type="number" id="globalMaxLossRatio" value="90" min="1" max="100" step="1">
-          <div class="param-hint">單次結算時，任一方損失比例的上限（避免瞬間全滅）。</div>
+          <div class="param-hint">單次結算時，任一方損失比例的上限。</div>
         </div>
         <div class="param-item">
           <label>最小戰敗比例（%）</label>
           <input type="number" id="globalMinLossRatio" value="10" min="0" max="100" step="1">
-          <div class="param-hint">單次結算時，任一方損失比例的下限（避免戰力差距過大時幾乎不損兵）。</div>
+          <div class="param-hint">單次結算時，任一方損失比例的下限。</div>
         </div>
       </div>
     </div>
@@ -178,7 +210,7 @@
         <div class="param-item">
           <label>兵力比修正係數</label>
           <input type="number" id="aiTeamFactor" value="0.4" min="0" max="2" step="0.05">
-          <div class="param-hint">目標兵力多於我方時，每多 1 倍需求提升的比例。0.4 = 40%。</div>
+          <div class="param-hint">目標兵力多於我方時，每多 1 倍需求提升的比例。</div>
         </div>
         <div class="param-item">
           <label>城牆 &gt; 30 分 乘數</label>
@@ -193,7 +225,7 @@
         <div class="param-item">
           <label>協防修正乘數</label>
           <input type="number" id="aiDefendFactor" value="0.70" min="0.1" max="1.5" step="0.05">
-          <div class="param-hint">協防時建議派兵量的乘數。0.7 = 只需進攻目標的七成兵力。</div>
+          <div class="param-hint">協防時建議派兵量的乘數。</div>
         </div>
         <div class="param-item">
           <label>縮放下限 %</label>
@@ -433,7 +465,7 @@
 <!-- ============ 戰鬥規則 ============ -->
 <section id="tab-rules" class="tab-content">
   <div class="card">
-    <div class="card-title">📖 城戰計算規則（v7.3）</div>
+    <div class="card-title">📖 城戰計算規則（v7.4）</div>
     <div class="rules-doc">
       <h2>一、對戰節奏</h2>
       <div class="rule-card ok">
@@ -445,47 +477,24 @@
       <ul>
         <li><b>戰前派兵佔比</b>：開局時派出的兵力（%）。</li>
         <li><b>復活後派兵佔比</b>：部隊復活後分配給該路線的佔比（%）。</li>
-        <li><b>優先順序</b>：數字越小越優先，用於「復活隊伍不足」時決定分配順序。</li>
+        <li><b>優先順序</b>：數字越小越優先。</li>
       </ul>
-      <h2>三、守方兵力分配</h2>
-      <div class="rule-card title">
-        守方總兵力 = atHome + Σ(協防路線兵力)<br>
-        按攻方各線兵力降序分配守方兵力，<br>
-        分配到守方兵力的線進行對撞，未分配到的線其剩餘攻方兵力可撞城。
-      </div>
-      <h2>四、復活分配</h2>
-      <ul>
-        <li>每批復活的隊伍按「復活後派兵佔比」分配給各路線。</li>
-        <li>按優先順序 1→2→3 分配，確保復活隊伍不足時先滿足高優先路線。</li>
-        <li>分配後剩餘的隊伍回到 atHome 作為留守。</li>
-      </ul>
-      <h2>五、行軍模型</h2>
+      <h2>三、行軍模型</h2>
       <ul>
         <li>戰敗後行軍回母城，抵達時才開始冷卻。</li>
         <li>冷卻結束後，再行軍至目標城參戰。</li>
         <li>防守方原地留守，不受行軍影響。</li>
       </ul>
-      <h2>六、城牆與淪陷</h2>
+      <h2>四、城牆與淪陷</h2>
       <ul>
         <li>城牆每 30 秒結算一次，由「未分配到守方兵力的攻方兵力」造成傷害。</li>
         <li>城牆歸零 → 城池淪陷，所有相關路線立刻終止。</li>
       </ul>
-      <h2>七、AI 佈兵建議</h2>
+      <h2>五、協作模式</h2>
       <ul>
-        <li>AI 依據戰力比、兵力比、城牆、攻守優劣，計算每條路線的最低有效派兵比例。</li>
-        <li>詳細參數可在「⚙️ 參數設定」中調整。</li>
-      </ul>
-      <h2>八、佈兵總覽</h2>
-      <ul>
-        <li><b>出兵視角</b>：每座城顯示派往哪些目標、派多少、留守多少。</li>
-        <li><b>受擊視角</b>：每座城顯示被誰攻擊、被誰協防、總受兵量。</li>
-        <li><b>矩陣視角</b>：城池 × 城池，一眼掃視全場攻防關係。</li>
-        <li><b>連線圖</b>：以 SVG 呈現攻防網絡，支援三種佈局（圓形/力導向/戰區群組）。</li>
-        <li><b>衝堂警示</b>：同一城受兵量遠超自身兵力時，顯示紅色警示。</li>
-      </ul>
-      <h2>九、盟徽</h2>
-      <ul>
-        <li>每個盟可設定一個 emoji 作為盟徽，會延伸到所有相關城池的陣營顯示。</li>
+        <li><b>Firebase 即時連線</b>：透過 Google Firebase 即時同步。</li>
+        <li><b>檔案協作</b>：匯出 JSON 檔案傳給朋友，合併編輯。</li>
+        <li><b>分享連結</b>：將沙盤壓縮成網址，貼給朋友載入。</li>
       </ul>
     </div>
   </div>
@@ -501,6 +510,19 @@
     <div class="modal-actions">
       <button class="btn btn-ghost" id="modalCancel">取消</button>
       <button class="btn btn-danger" id="modalConfirm">確認執行</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 匯入對話框 ============ -->
+<div class="modal-overlay" id="importModal">
+  <div class="modal-box">
+    <h3>📥 匯入沙盤</h3>
+    <p id="importModalInfo" style="white-space:pre-wrap;"></p>
+    <div class="modal-actions" style="flex-direction:column;gap:8px;">
+      <button class="btn btn-danger btn-block" id="importModeOverwrite">🔄 覆蓋現有資料</button>
+      <button class="btn btn-primary btn-block" id="importModeMerge">➕ 合併（匯入資料優先）</button>
+      <button class="btn btn-ghost btn-block" id="importModeCancel">取消</button>
     </div>
   </div>
 </div>
@@ -553,7 +575,7 @@
       <div id="cm_attackList" class="target-list"><div class="empty-hint">載入中...</div></div>
       <div class="section-label ally" id="defendSectionLabel">🛡️ 選擇協防的城池</div>
       <div id="cm_defendList" class="target-list"><div class="empty-hint">載入中...</div></div>
-      <div class="text-dim mt-8">＊每條路線獨立設定：戰前派兵%、復活後派兵%、優先順序。<br>＊復活後派兵% 用於決定復活隊伍分配；優先順序數字越小越優先。<br>＊「🤖 建議 XX%」由 AI 依戰力與兵力計算，可在「參數設定」頁面調整參數。</div>
+      <div class="text-dim mt-8">＊每條路線獨立設定：戰前派兵%、復活後派兵%、優先順序。<br>＊「🤖 建議 XX%」由 AI 依戰力與兵力計算，可在「參數設定」頁面調整參數。</div>
     </div>
     <div class="modal-actions">
       <button class="btn btn-ghost" id="cityModalCancel">取消</button>

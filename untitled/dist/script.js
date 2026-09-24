@@ -1,14 +1,12 @@
 /* ============================================================================
- * v7.3：房間連線 / 參數設定 / 盟徽 / 佈兵總覽（含連線圖三佈局）
+ * v7.4：Firebase 即時連線 + 盟徽 + 佈兵總覽（含連線圖三佈局）
  * ========================================================================== */
 (function(){
 'use strict';
 
-const LS_PREFIX = 'slg_sandtable_v70_';
+const LS_PREFIX = 'slg_sandtable_v74_';
 const AI_LS_KEY = 'slg_ai_params';
-const HEARTBEAT_INTERVAL = 3000;
-const HOST_TIMEOUT = 9000;
-const PING_INTERVAL = 5000;
+const HOST_TIMEOUT = 15000;   // presence 逾時（毫秒）
 const SIM_CHUNK = 500;
 const VIZ_CHUNK_SIZE = 6000;
 const VIZ_SNAPSHOT_INTERVAL = 5;
@@ -16,12 +14,6 @@ const EDIT_LOCK_TTL = 30000;
 const DYN_ROUTE_SAMPLE_SEC = 5;
 const COMBAT_TICK = 30;
 
-const MQTT_BROKERS = [
-  { name: 'EMQX',      uri: 'wss://broker.emqx.io:8084/mqtt' },
-  { name: 'HiveMQ',    uri: 'wss://broker.hivemq.com:8884/mqtt' },
-  { name: 'Mosquitto', uri: 'wss://test.mosquitto.org:8081/mqtt' },
-];
-const TOPIC_PREFIX = 'slg_sandtable/room/';
 const PERCENT_OPTIONS = [0, 17, 33, 50, 67, 84, 100];
 
 const ATTACK_RULES = {
@@ -35,7 +27,7 @@ const ALLIANCE_SIDE_LABELS = {self:'本方',ally:'同盟',enemy:'敵方'};
 
 const EVT = {
   MEMBERS:'members', LOCKS:'locks', DATA:'data',
-  CONN:'conn', PING:'ping', HOST:'host',
+  CONN:'conn', HOST:'host', CHAT_NEW:'chat:new',
   SIM_TRIGGER:'sim:trigger', DEBUG:'debug', VIZ_SNAPSHOTS:'viz:snapshots', VIZ_RESET:'viz:reset',
   DYN_RESULT:'dyn:result',
 };
@@ -73,7 +65,7 @@ function computeAllocation(city){
 function calcAllianceAvgPower(a){ const mc = Number(a.memberCount)||0; const tp = Number(a.totalPower)||0; return mc>0 ? tp/mc : 0; }
 function getAllianceAvgPower(a){ if(typeof a.avgPower === 'number' && a.avgPower > 0) return a.avgPower; return calcAllianceAvgPower(a); }
 
-/* AI 佈兵助手 */
+/* ============ AI 佈兵助手 ============ */
 const AI = (() => {
   const DEFAULT_PARAMS = {
     r25: 25, r20: 33, r15: 50, r12: 60, r10: 70, r08: 84, r06: 95, r00: 100,
@@ -157,7 +149,7 @@ const AI = (() => {
 
 const state = {
   commanderName:'', roomCode:'', isHost:false, hostName:'',
-  connected:false, connecting:false, pingMs:null, myClientId:'',
+  connected:false, connecting:false, myClientId:'',
   members:{}, editLocks:{}, isSimulating:false,
   settings:{
     timeLimitMin:120, consumeMinPerMin:10, consumeMaxPerMin:30,
@@ -183,7 +175,7 @@ function clearDirty(){ state.dirty.settings = false; for(const k of ['alliance',
 function saveState(){
   try{
     localStorage.setItem(LS_PREFIX+'state', JSON.stringify({
-      commanderName:state.commanderName, roomCode:state.roomCode, isHost:state.isHost, hostName:state.hostName,
+      commanderName:state.commanderName, roomCode:state.roomCode,
       settings:state.settings, settingsRev:state.settingsRev, lamport:state.lamport, entityRev:state.entityRev,
       roomEpoch:state.roomEpoch, alliances:state.alliances, zones:state.zones, cities:state.cities,
       dynRows: state.dynRows.slice(-5000),
@@ -196,7 +188,7 @@ function loadState(){
     const raw = localStorage.getItem(LS_PREFIX+'state');
     if(!raw) return;
     const d = JSON.parse(raw);
-    for(const k of ['commanderName','roomCode','isHost','hostName','settingsRev','lamport','roomEpoch']){
+    for(const k of ['commanderName','roomCode','settingsRev','lamport','roomEpoch']){
       if(d[k]!==undefined) state[k]=d[k];
     }
     if(d.settings) Object.assign(state.settings, d.settings);
@@ -303,7 +295,7 @@ function flushPatches(){
     const patches = collectDirtyPatches();
     if(patches.length === 0) return;
     sender(patches); clearDirty();
-  }, 40);
+  }, 60);
 }
 function buildFullSnapshot(){
   return { type:'sync_snapshot', epoch: state.roomEpoch, lamport: state.lamport, settingsRev: state.settingsRev,
@@ -340,223 +332,332 @@ function applyFullSnapshot(snap){
   return true;
 }
 
-/* ================== Transport ================== */
-let client = null;
-let heartbeatTimer = null, hostCheckTimer = null, pingTimer = null, reconnectTimer = null;
-let lockGCTimer = null, lockRenewTimer = null;
-const isConnected = () => state.connected && !!client;
+/* ================== Firebase Transport ================== */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyDjfakubDKBpCi4xi1l_W_M6f9MdNC0oe0",
+  authDomain: "ya-sandbox.firebaseapp.com",
+  databaseURL: "https://ya-sandbox-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "ya-sandbox",
+  storageBucket: "ya-sandbox.firebasestorage.app",
+  messagingSenderId: "648660430942",
+  appId: "1:648660430942:web:bb09124cbb3a2dc72f44cf"
+};
 
-let currentBrokerIndex = 0;
-let connectAttemptTimer = null;
+let fbApp = null;
+let fbDb = null;
+let fbConnected = false;
+let presenceRef = null;
+let eventsRef = null;
+let locksRef = null;
+let chatRef = null;
+let presenceWatchRef = null;
+let connWatchRef = null;
+let lastSeenTimer = null;
+let lockRenewTimer = null;
+const fbEventHandlers = [];
+const myEditLocks = new Set();
+let connectTime = Date.now();
+let connectWaitTimer = null;
 
-function connectMQTT(roomCode, asHost){
+const isConnected = () => fbConnected && !!fbDb && !!state.roomCode;
+
+function connectFirebase(roomCode, asHost){
   if(!roomCode || roomCode.length!==6){ emit(EVT.DEBUG, {msg:'❌ 房間碼必須為6位數', err:true}); return; }
   if(!state.commanderName){ emit(EVT.DEBUG, {msg:'❌ 請先填寫指揮官名稱', err:true}); return; }
-  if(client){ try{ client.disconnect(); }catch(e){} client = null; }
-  clearTimeout(connectAttemptTimer);
+
+  if(fbConnected || state.connecting) disconnectFirebase();
 
   state.roomCode = roomCode;
   state.myClientId = 'slg_' + uid();
-  state.connecting = true; state.connected = false;
+  state.connecting = true;
+  state.connected = false;
+  connectTime = Date.now();
   emit(EVT.CONN);
+  emit(EVT.DEBUG, {msg:'🟡 正在連線至 Firebase...'});
 
-  const broker = MQTT_BROKERS[currentBrokerIndex];
-  emit(EVT.DEBUG, {msg:`🟡 嘗試連線至 ${broker.name}（${currentBrokerIndex + 1}/${MQTT_BROKERS.length}）...`});
+  try{
+    if(!fbApp){
+      fbApp = firebase.initializeApp(FIREBASE_CONFIG);
+      fbDb = firebase.database();
+    }
+  }catch(e){
+    state.connecting = false;
+    emit(EVT.CONN);
+    emit(EVT.DEBUG, {msg:'❌ Firebase 初始化失敗：' + e.message, err:true});
+    return;
+  }
 
-  const c = new Paho.MQTT.Client(broker.uri, state.myClientId);
-  client = c;
-
-  // 10 秒連線超時保護
-  connectAttemptTimer = setTimeout(() => {
-    if(!state.connected && state.connecting){
-      emit(EVT.DEBUG, {msg:`⏱️ ${broker.name} 連線超時，切換至下一個 broker...`, err:true});
-      try{ c.disconnect(); }catch(e){}
-      tryNextBroker();
+  clearTimeout(connectWaitTimer);
+  connectWaitTimer = setTimeout(() => {
+    if(!fbConnected){
+      state.connecting = false;
+      emit(EVT.CONN);
+      emit(EVT.DEBUG, {msg:'⏱️ Firebase 連線超時，請檢查網路或資料庫規則', err:true});
     }
   }, 10000);
 
-  c.onConnectionLost = resp => {
-    state.connected = false; state.connecting = false;
-    emit(EVT.CONN);
-    emit(EVT.DEBUG, {msg:'🔴 連線中斷：'+(resp.errorCode||'unknown'), err:true});
-    // 中斷時也嘗試切換 broker
-    tryNextBroker();
-  };
-
-  c.onMessageArrived = msg => { try{ handleIncoming(JSON.parse(msg.payloadString)); }catch(e){ console.warn('訊息解析失敗', e); } };
-
-  c.connect({
-    onSuccess: () => {
-      clearTimeout(connectAttemptTimer);
-      state.connected = true; state.connecting = false;
+  connWatchRef = fbDb.ref('.info/connected');
+  connWatchRef.on('value', snap => {
+    const connected = snap.val() === true;
+    if(connected && !fbConnected){
+      clearTimeout(connectWaitTimer);
+      onFirebaseConnected(asHost);
+    } else if(!connected && fbConnected){
+      fbConnected = false;
+      state.connected = false;
       emit(EVT.CONN);
-      emit(EVT.DEBUG, {msg:`🟢 成功連接 ${broker.name}！`});
-      c.subscribe(TOPIC_PREFIX + roomCode);
-      if(asHost){ state.isHost = true; state.hostName = state.commanderName; state.roomEpoch = uid(); }
-      else { state.isHost = false; state.hostName = ''; }
-      state.members[state.myClientId] = { name: state.commanderName, joinTime: Date.now(), isHost: state.isHost, lastSeen: Date.now() };
-      emit(EVT.MEMBERS); emit(EVT.HOST); saveState();
-      startHeartbeat(); startPingCheck(); startEditLockGC();
-      if(state.isHost) setTimeout(() => publish(buildFullSnapshot()), 300);
-      else publish({ type:'sync_request', clientId:state.myClientId, name:state.commanderName });
-    },
-    onFailure: err => {
-      clearTimeout(connectAttemptTimer);
-      state.connected = false; state.connecting = false;
-      emit(EVT.CONN);
-      emit(EVT.DEBUG, {msg:`🔴 ${broker.name} 連線失敗：${err.errorCode||'無法連接'}`, err:true});
-      tryNextBroker();
-    },
-    keepAliveInterval: 30,
-    cleanSession: true,
-    reconnect: false,   // 我們自己控制重連，關閉 Paho 自動重連
-    timeout: 8,         // 8 秒連線超時
-    useSSL: true,
+      emit(EVT.DEBUG, {msg:'🔴 Firebase 連線中斷，嘗試自動重連...', err:true});
+    }
   });
 }
 
-function tryNextBroker(){
-  if(!state.roomCode) return;
-  if(!state.connecting && !state.connected && !state.isSimulating && !state.members) return;
-  currentBrokerIndex = (currentBrokerIndex + 1) % MQTT_BROKERS.length;
-  setTimeout(() => {
-    if(!state.connected && state.roomCode){
-      connectMQTT(state.roomCode, state.isHost);
+function onFirebaseConnected(asHost){
+  fbConnected = true;
+  state.connected = true;
+  state.connecting = false;
+  emit(EVT.CONN);
+  emit(EVT.DEBUG, {msg:'🟢 已連線至 Firebase！'});
+
+  const now = Date.now();
+  state.isHost = !!asHost;
+  state.hostName = asHost ? state.commanderName : '';
+
+  // Presence
+  presenceRef = fbDb.ref(`rooms/${state.roomCode}/presence/${state.myClientId}`);
+  presenceRef.set({
+    name: state.commanderName,
+    joinTime: now,
+    isHost: state.isHost,
+    lastSeen: now,
+  });
+  presenceRef.onDisconnect().remove();
+
+  clearInterval(lastSeenTimer);
+  lastSeenTimer = setInterval(() => {
+    if(fbConnected && presenceRef) presenceRef.update({ lastSeen: Date.now() });
+  }, 5000);
+
+  presenceWatchRef = fbDb.ref(`rooms/${state.roomCode}/presence`);
+  presenceWatchRef.on('value', snap => {
+    const presence = snap.val() || {};
+    state.members = {};
+    const nowTs = Date.now();
+    for(const cid in presence){
+      const m = presence[cid];
+      if(!m) continue;
+      if(nowTs - (m.lastSeen||0) < HOST_TIMEOUT){
+        state.members[cid] = { name:m.name, joinTime:m.joinTime, isHost:!!m.isHost, lastSeen:m.lastSeen };
+      }
     }
-  }, 500);
+    emit(EVT.MEMBERS);
+    checkHostHealthFirebase();
+  });
+
+  // Events
+  eventsRef = fbDb.ref(`rooms/${state.roomCode}/events`);
+  const evHandler = eventsRef.limitToLast(200).on('child_added', snap => {
+    const p = snap.val();
+    if(!p) return;
+    if(p._from === state.myClientId) return;
+    if(p._ts && p._ts < connectTime) return;
+    handleIncoming(p);
+  });
+  fbEventHandlers.push({ ref: eventsRef, evt:'child_added', fn: evHandler });
+
+  // Locks
+  locksRef = fbDb.ref(`rooms/${state.roomCode}/locks`);
+  locksRef.on('value', snap => {
+    state.editLocks = snap.val() || {};
+    emit(EVT.LOCKS);
+  });
+
+  // Chat
+  chatRef = fbDb.ref(`rooms/${state.roomCode}/chat`);
+  const chatHandler = chatRef.limitToLast(100).on('child_added', snap => {
+    const m = snap.val();
+    if(!m) return;
+    if(m._from === state.myClientId) return;
+    if(m._ts && m._ts < connectTime) return;
+    emit(EVT.CHAT_NEW, { sender:m.sender, text:m.text, time:m.time });
+  });
+  fbEventHandlers.push({ ref: chatRef, evt:'child_added', fn: chatHandler });
+
+  saveState();
+  emit(EVT.HOST);
+
+  if(state.isHost){
+    state.roomEpoch = uid();
+    setTimeout(() => {
+      if(state.alliances.length || state.zones.length || state.cities.length){
+        publish(buildFullSnapshot());
+        emit(EVT.DEBUG, {msg:'📤 已推送現有沙盤快照'});
+      }
+    }, 400);
+  } else {
+    setTimeout(() => {
+      publish({ type:'sync_request', clientId:state.myClientId, name:state.commanderName });
+    }, 400);
+  }
+
+  startEditLockRenew();
 }
-function scheduleReconnect(){
-  clearTimeout(reconnectTimer);
-  if(!state.roomCode) return;
-  reconnectTimer = setTimeout(() => {
-    if(!state.connected && state.roomCode){
-      // 換一個 broker 再試
-      currentBrokerIndex = (currentBrokerIndex + 1) % MQTT_BROKERS.length;
-      emit(EVT.DEBUG, {msg:'🟡 重新嘗試連線...'});
-      connectMQTT(state.roomCode, state.isHost);
-    }
-  }, 3000);
-}
-function disconnectMQTT(){
-  clearTimeout(connectAttemptTimer); 
-  clearInterval(heartbeatTimer); clearInterval(hostCheckTimer); clearInterval(pingTimer);
-  clearTimeout(reconnectTimer); clearInterval(lockGCTimer); clearInterval(lockRenewTimer);
-  if(client){ try{ client.disconnect(); }catch(e){} client = null; }
-  state.connected = false; state.connecting = false; state.isHost = false; state.hostName = ''; state.members = {}; state.roomCode = '';
-  emit(EVT.CONN); emit(EVT.MEMBERS); emit(EVT.HOST); emit(EVT.DEBUG, {msg:'🔴 已中斷連線'}); saveState();
-}
-function publish(payload){
-  if(!state.connected || !client) return;
-  try{ const msg = new Paho.MQTT.Message(JSON.stringify(payload)); msg.destinationName = TOPIC_PREFIX + state.roomCode; client.send(msg); }catch(e){ console.warn('發送失敗', e); }
-}
-function startHeartbeat(){
-  clearInterval(heartbeatTimer);
-  heartbeatTimer = setInterval(() => {
-    if(!state.connected) return;
-    const me = state.members[state.myClientId];
-    if(me){ me.lastSeen = Date.now(); me.isHost = state.isHost; me.name = state.commanderName; }
-    publish({ type:'heartbeat', clientId:state.myClientId, name:state.commanderName, joinTime: me?.joinTime || Date.now(), isHost: state.isHost, timestamp: Date.now() });
-  }, HEARTBEAT_INTERVAL);
-  clearInterval(hostCheckTimer);
-  hostCheckTimer = setInterval(checkHostHealth, HEARTBEAT_INTERVAL);
-}
-function checkHostHealth(){
-  if(!state.connected) return;
+
+function checkHostHealthFirebase(){
+  if(!fbConnected) return;
   const now = Date.now();
   let hostAlive = false;
   const online = [];
   for(const cid in state.members){
     const m = state.members[cid];
-    if(now - m.lastSeen < HOST_TIMEOUT){ online.push({cid, m}); if(m.isHost) hostAlive = true; }
-    else delete state.members[cid];
+    if(now - (m.lastSeen||0) < HOST_TIMEOUT){ online.push({cid, m}); if(m.isHost) hostAlive = true; }
   }
-  emit(EVT.MEMBERS);
-  if(!hostAlive && online.length > 0){
+  if(!hostAlive && online.length > 0 && !state.isHost){
     online.sort((a,b) => a.m.joinTime - b.m.joinTime);
     const heir = online[0];
-    for(const cid in state.members) state.members[cid].isHost = false;
-    state.members[heir.cid].isHost = true;
-    state.isHost = (heir.cid === state.myClientId);
-    state.hostName = heir.m.name;
-    emit(EVT.HOST);
-    logSystem(`👑 房主已轉移給 ${heir.m.name}`);
-    if(state.isHost){ state.roomEpoch = uid(); setTimeout(() => publish(buildFullSnapshot()), 500); }
-    else setTimeout(() => publish({ type:'sync_request', clientId:state.myClientId, name:state.commanderName }), 1500);
+    if(heir.cid === state.myClientId){
+      state.isHost = true;
+      state.hostName = state.commanderName;
+      state.roomEpoch = uid();
+      if(presenceRef) presenceRef.update({ isHost: true });
+      emit(EVT.HOST);
+      logSystem('👑 你已成為房主');
+      saveState();
+    }
   }
 }
-function startPingCheck(){ clearInterval(pingTimer); pingTimer = setInterval(() => { if(!state.connected || !client) return; publish({ type:'ping', clientId:state.myClientId, t:Date.now() }); }, PING_INTERVAL); }
-function startEditLockGC(){
-  clearInterval(lockGCTimer);
-  lockGCTimer = setInterval(() => {
-    const now = Date.now(); let changed = false;
-    for(const cityId in state.editLocks){ const lock = state.editLocks[cityId]; if(lock.expiresAt && lock.expiresAt < now){ delete state.editLocks[cityId]; changed = true; } }
-    if(changed) emit(EVT.LOCKS);
-  }, 10000);
+
+function disconnectFirebase(){
+  clearTimeout(connectWaitTimer);
+  clearInterval(lastSeenTimer);
+  clearInterval(lockRenewTimer);
+
+  for(const h of fbEventHandlers){
+    try{ h.ref.off(h.evt, h.fn); }catch(e){}
+  }
+  fbEventHandlers.length = 0;
+
+  if(locksRef && myEditLocks.size > 0){
+    for(const cityId of myEditLocks){
+      try{ locksRef.child(cityId).remove(); }catch(e){}
+    }
+    myEditLocks.clear();
+  }
+
+  if(presenceRef){ try{ presenceRef.onDisconnect().cancel(); presenceRef.remove(); }catch(e){} }
+  if(locksRef){ try{ locksRef.off(); }catch(e){} }
+  if(chatRef){ try{ chatRef.off(); }catch(e){} }
+  if(presenceWatchRef){ try{ presenceWatchRef.off(); }catch(e){} }
+  if(connWatchRef){ try{ connWatchRef.off(); }catch(e){} }
+
+  presenceRef = null; locksRef = null; chatRef = null;
+  presenceWatchRef = null; connWatchRef = null; eventsRef = null;
+
+  fbConnected = false;
+  state.connected = false;
+  state.connecting = false;
+  state.isHost = false;
+  state.hostName = '';
+  state.members = {};
+  state.editLocks = {};
+  state.roomCode = '';
+  emit(EVT.CONN); emit(EVT.MEMBERS); emit(EVT.HOST); emit(EVT.LOCKS);
+  emit(EVT.DEBUG, {msg:'🔴 已中斷連線'});
+  saveState();
+}
+
+function publish(payload){
+  if(!fbConnected || !fbDb || !state.roomCode) return;
+  try{
+    if(payload.type === 'chat'){
+      fbDb.ref(`rooms/${state.roomCode}/chat`).push({
+        sender: payload.sender,
+        text: payload.text,
+        time: nowTime(),
+        _from: state.myClientId,
+        _ts: Date.now(),
+      });
+      return;
+    }
+    fbDb.ref(`rooms/${state.roomCode}/events`).push({
+      ...payload,
+      _from: state.myClientId,
+      _ts: Date.now(),
+    });
+  }catch(e){
+    console.warn('Firebase 發送失敗', e);
+  }
+}
+
+function acquireEditLock(cityId){
+  if(!fbConnected || !fbDb || !state.roomCode) return;
+  const ref = fbDb.ref(`rooms/${state.roomCode}/locks/${cityId}`);
+  ref.set({
+    clientId: state.myClientId,
+    name: state.commanderName,
+    expiresAt: Date.now() + EDIT_LOCK_TTL,
+  });
+  ref.onDisconnect().remove();
+  myEditLocks.add(cityId);
+}
+
+function releaseEditLock(cityId){
+  if(!fbDb || !state.roomCode || !myEditLocks.has(cityId)) return;
+  try{ fbDb.ref(`rooms/${state.roomCode}/locks/${cityId}`).remove(); }catch(e){}
+  myEditLocks.delete(cityId);
+}
+
+function startEditLockRenew(){
   clearInterval(lockRenewTimer);
   lockRenewTimer = setInterval(() => {
-    if(!state.connected) return;
-    for(const cityId in state.editLocks){ if(state.editLocks[cityId].clientId === state.myClientId) publish({ type:'edit_lock_renew', cityId, clientId:state.myClientId }); }
-  }, 15000);
+    if(!fbConnected || !locksRef) return;
+    for(const cityId of myEditLocks){
+      try{ locksRef.child(cityId).update({ expiresAt: Date.now() + EDIT_LOCK_TTL }); }catch(e){}
+    }
+  }, 10000);
 }
-const incomingVizChunks = new Map();
-const incomingDynChunks = new Map();
+
+function connectMQTT(roomCode, asHost){ connectFirebase(roomCode, asHost); }
+function disconnectMQTT(){ disconnectFirebase(); }
 
 function handleIncoming(payload){
   if(!payload || !payload.type) return;
-  if(payload.clientId){
-    const m = state.members[payload.clientId];
-    if(m){ m.lastSeen = Date.now(); if(payload.name) m.name = payload.name; if(payload.isHost !== undefined) m.isHost = payload.isHost; }
-    else if(payload.name && payload.joinTime) state.members[payload.clientId] = { name:payload.name, joinTime:payload.joinTime, isHost:!!payload.isHost, lastSeen:Date.now() };
-  }
   switch(payload.type){
-    case 'heartbeat': emit(EVT.MEMBERS); break;
-    case 'ping': publish({ type:'pong', clientId:state.myClientId, t:payload.t }); break;
-    case 'pong': if(payload.t){ state.pingMs = Date.now() - payload.t; emit(EVT.PING); } break;
     case 'sync_patch': {
-      if(payload.clientId === state.myClientId) return;
       let changed = false;
       for(const p of payload.patches || []) if(applyPatch(p)) changed = true;
       if(changed){ emit(EVT.DATA); saveState(); }
       break;
     }
     case 'sync_snapshot': {
-      if(payload.clientId === state.myClientId) return;
-      if(applyFullSnapshot(payload)){ emit(EVT.DATA); saveState(); }
+      if(applyFullSnapshot(payload)){ emit(EVT.DATA); saveState(); emit(EVT.DEBUG, {msg:'🔄 已同步房主快照'}); }
       break;
     }
     case 'sync_request': {
-      if(!state.isHost || payload.clientId === state.myClientId) return;
+      if(!state.isHost) return;
+      logSystem(`🔄 ${payload.name||'盟友'} 請求同步，傳送快照...`);
       publish(buildFullSnapshot());
       break;
     }
-    case 'edit_lock': state.editLocks[payload.cityId] = { name:payload.name, clientId:payload.clientId, expiresAt: Date.now() + EDIT_LOCK_TTL }; emit(EVT.LOCKS); break;
-    case 'edit_unlock': delete state.editLocks[payload.cityId]; emit(EVT.LOCKS); break;
-    case 'edit_lock_renew': { const lock = state.editLocks[payload.cityId]; if(lock && lock.clientId === payload.clientId) lock.expiresAt = Date.now() + EDIT_LOCK_TTL; break; }
     case 'trigger_simulate': emit(EVT.SIM_TRIGGER, payload); break;
-    case 'viz_chunk': {
-      incomingVizChunks.set(payload.part, payload.data);
-      if(incomingVizChunks.size === payload.total){
-        let full = '';
-        for(let i=0;i<payload.total;i++) full += incomingVizChunks.get(i) || '';
-        incomingVizChunks.clear();
-        try{ const parsed = JSON.parse(full); if(parsed.baseMin !== undefined) state.simBaseMin = parsed.baseMin; for(const [sec, snap] of parsed.snapEntries) viz.ingestSnapshot(sec, snap); viz.finalize(); }catch(e){ console.warn('viz chunk 解析失敗', e); }
+    case 'viz_payload': {
+      if(payload.data){
+        try{
+          const parsed = payload.data;
+          if(parsed.baseMin !== undefined) state.simBaseMin = parsed.baseMin;
+          for(const [sec, snap] of parsed.snapEntries) viz.ingestSnapshot(sec, snap);
+          viz.finalize();
+        }catch(e){ console.warn('viz 解析失敗', e); }
       }
       break;
     }
-    case 'dyn_chunk': {
-      incomingDynChunks.set(payload.part, payload.data);
-      if(incomingDynChunks.size === payload.total){
-        let full = '';
-        for(let i=0;i<payload.total;i++) full += incomingDynChunks.get(i) || '';
-        incomingDynChunks.clear();
-        try{ state.dynRows = JSON.parse(full); emit(EVT.DYN_RESULT); }catch(e){ console.warn('dyn chunk 解析失敗', e); }
-      }
+    case 'dyn_payload': {
+      if(payload.rows){ state.dynRows = payload.rows; emit(EVT.DYN_RESULT); }
       break;
     }
   }
 }
 /* ============================================================
-   模擬引擎 v7.3
+   模擬引擎 v7.4
    ============================================================ */
 async function runSimulation(cities, settings, opts = {}){
   const { onProgress, shouldAbort, snapshotAt = new Set(), onSnapshot, dynSampleAt = new Set(), onDynSample } = opts;
@@ -1270,13 +1371,13 @@ const R = (() => {
     if(state.connected){ cls = 'green'; label = '連線成功'; }
     else if(state.connecting){ cls = 'yellow'; label = '連線中...'; }
     else { cls = 'red'; label = '未連線'; }
-    dot.className = 'health-dot ' + cls; text.textContent = label;
+    if(dot) dot.className = 'health-dot ' + cls;
+    if(text) text.textContent = label;
   }
   function renderHost(){
     const el = document.getElementById('hostDisplay');
     if(el) el.textContent = state.hostName ? `房主：${state.hostName}${state.isHost ? '（你）' : ''}` : '';
   }
-  function renderPing(){ const el = document.getElementById('pingDisplay'); if(el) el.textContent = `延遲：${state.pingMs ?? '--'}ms`; }
   function renderDebug({msg, err} = {}){
     const el = document.getElementById('debugLog');
     if(!el || !msg) return;
@@ -1399,8 +1500,8 @@ const R = (() => {
     el.scrollTop = el.scrollHeight;
   }
   function renderProgress(p){ const bar = document.getElementById('simProgress'); if(bar) bar.style.width = Math.round(p*100) + '%'; }
-  function renderAll(){ renderHealth(); renderHost(); renderPing(); renderMembers(); renderAlliances(); renderZones(); renderCities(); }
-  return { renderHealth, renderHost, renderPing, renderDebug, renderMembers, renderAlliances, renderMatrix, renderZones, renderCities, renderNarrative, renderProgress, renderAll };
+  function renderAll(){ renderHealth(); renderHost(); renderMembers(); renderAlliances(); renderZones(); renderCities(); }
+  return { renderHealth, renderHost, renderDebug, renderMembers, renderAlliances, renderMatrix, renderZones, renderCities, renderNarrative, renderProgress, renderAll };
 })();
 
 /* ============ DYN ============ */
@@ -1496,423 +1597,6 @@ const DYN = (() => {
   }
   return { init, setRows, renderTable, populateCityFilters };
 })();
-
-/* ============ 同盟表單 ============ */
-function updateAllianceAvgPowerPreview(){
-  const mc = parseFloat(document.getElementById('allyMemberCount').value) || 0;
-  const tp = parseFloat(document.getElementById('allyTotalPower').value) || 0;
-  document.getElementById('allyAvgPower').value = mc > 0 ? (tp / mc).toLocaleString(undefined,{maximumFractionDigits:2}) : '0';
-}
-function resetAllianceForm(){
-  state.editingAllianceId = null;
-  document.getElementById('allyFormTitle').textContent = '➕ 新增同盟';
-  document.getElementById('allyName').value = '';
-  document.getElementById('allyIcon').value = '';
-  document.getElementById('allySide').value = 'ally';
-  document.getElementById('allyMemberCount').value = 100;
-  document.getElementById('allyTotalPower').value = 20000;
-  document.getElementById('btnCancelAllianceEdit').style.display = 'none';
-  document.getElementById('btnSaveAlliance').textContent = '💾 儲存';
-  updateAllianceAvgPowerPreview();
-  R.renderAlliances();
-}
-function startEditAlliance(id){
-  const a = state.alliances.find(x => x.id === id);
-  if(!a) return;
-  state.editingAllianceId = id;
-  document.getElementById('allyFormTitle').textContent = `✏️ 編輯同盟：${esc(a.name)}`;
-  document.getElementById('allyName').value = a.name || '';
-  document.getElementById('allyIcon').value = a.icon || '';
-  document.getElementById('allySide').value = a.side || 'ally';
-  document.getElementById('allyMemberCount').value = a.memberCount || 100;
-  document.getElementById('allyTotalPower').value = a.totalPower || 20000;
-  document.getElementById('btnCancelAllianceEdit').style.display = 'inline-flex';
-  document.getElementById('btnSaveAlliance').textContent = '💾 更新';
-  updateAllianceAvgPowerPreview();
-  R.renderAlliances();
-}
-
-/* ============ AI 參數 UI 同步 ============ */
-function syncAIParamsToUI(){
-  const p = AI.getParams();
-  document.getElementById('aiR25').value = p.r25;
-  document.getElementById('aiR20').value = p.r20;
-  document.getElementById('aiR15').value = p.r15;
-  document.getElementById('aiR12').value = p.r12;
-  document.getElementById('aiR10').value = p.r10;
-  document.getElementById('aiR08').value = p.r08;
-  document.getElementById('aiR06').value = p.r06;
-  document.getElementById('aiR00').value = p.r00;
-  document.getElementById('aiTeamFactor').value = p.teamFactor;
-  document.getElementById('aiWallFactor1').value = p.wallFactor1;
-  document.getElementById('aiWallFactor2').value = p.wallFactor2;
-  document.getElementById('aiDefendFactor').value = p.defendFactor;
-  document.getElementById('aiMinPct').value = p.minPct;
-}
-function readAIParamsFromUI(){
-  return {
-    r25: parseFloat(document.getElementById('aiR25').value) || 25,
-    r20: parseFloat(document.getElementById('aiR20').value) || 33,
-    r15: parseFloat(document.getElementById('aiR15').value) || 50,
-    r12: parseFloat(document.getElementById('aiR12').value) || 60,
-    r10: parseFloat(document.getElementById('aiR10').value) || 70,
-    r08: parseFloat(document.getElementById('aiR08').value) || 84,
-    r06: parseFloat(document.getElementById('aiR06').value) || 95,
-    r00: parseFloat(document.getElementById('aiR00').value) || 100,
-    teamFactor: parseFloat(document.getElementById('aiTeamFactor').value) || 0.4,
-    wallFactor1: parseFloat(document.getElementById('aiWallFactor1').value) || 1.10,
-    wallFactor2: parseFloat(document.getElementById('aiWallFactor2').value) || 1.15,
-    defendFactor: parseFloat(document.getElementById('aiDefendFactor').value) || 0.70,
-    minPct: parseFloat(document.getElementById('aiMinPct').value) || 17,
-  };
-}
-
-/* ============ UI ============ */
-let editingCityId = null;
-let confirmCb = null;
-function showConfirm(title, msg, cb){ document.getElementById('modalTitle').textContent = '⚠️ ' + title; document.getElementById('modalMessage').textContent = msg; document.getElementById('confirmModal').classList.add('show'); confirmCb = cb; }
-
-function validateCrossDay(cities, timeLimitMin){
-  if(cities.length === 0) return {ok:true};
-  const mins = cities.map(c => hhmmToMinutes(c.defStartTime || '19:00'));
-  if((Math.max(...mins) - Math.min(...mins)) + timeLimitMin > 1440) return { ok: false, msg: `時間跨度 + 時長超過 24 小時。` };
-  return {ok:true};
-}
-function updateSectionLabels(){
-  const mySide = document.getElementById('cm_side').value;
-  const atkSides = (ATTACK_RULES[mySide] || []).map(sideLabel).join(' / ');
-  const defSides = (DEFEND_RULES[mySide] || []).map(sideLabel).join(' / ');
-  document.getElementById('attackSectionLabel').textContent = `⚔️ 選擇進攻的城池（限 ${atkSides || '無'}）`;
-  document.getElementById('defendSectionLabel').textContent = `🛡️ 選擇協防的城池${defSides ? `（限 ${defSides}）` : '（不可協防）'}`;
-}
-function updateAutoCalcFields(){
-  const t = parseFloat(document.getElementById('cm_totalTeams').value)||0;
-  const p = parseFloat(document.getElementById('cm_totalPower').value)||0;
-  document.getElementById('cm_avgPower').value = t > 0 ? Math.floor(p/t) : 0;
-}
-function updateAllocPanel(){
-  const total = parseFloat(document.getElementById('cm_totalTeams').value) || 0;
-  let atkSum = 0, defSum = 0;
-  document.querySelectorAll('.atk-cb:checked').forEach(cb => { const sel = document.querySelector(`.atk-pre[data-city="${cb.dataset.city}"]`); atkSum += Math.floor(total * (parseFloat(sel.value)||0) / 100); });
-  document.querySelectorAll('.def-cb:checked').forEach(cb => { const sel = document.querySelector(`.def-pre[data-city="${cb.dataset.city}"]`); defSum += Math.floor(total * (parseFloat(sel.value)||0) / 100); });
-  const allocated = atkSum + defSum, reserve = total - allocated;
-  document.getElementById('cm_allocTotal').textContent = total;
-  document.getElementById('cm_allocAtk').textContent = atkSum;
-  document.getElementById('cm_allocDef').textContent = defSum;
-  const reserveEl = document.getElementById('cm_allocReserve');
-  reserveEl.textContent = reserve;
-  reserveEl.style.color = reserve < 0 ? 'var(--neon-red)' : 'var(--neon-green)';
-  document.getElementById('cm_allocWarning').style.display = reserve < 0 ? 'block' : 'none';
-}
-function renderTargetSelectors(attackTargets, defendTargets){
-  const zoneId = document.getElementById('cm_zone').value, mySide = document.getElementById('cm_side').value;
-  const attackEl = document.getElementById('cm_attackList'), defendEl = document.getElementById('cm_defendList');
-  const pool = state.cities.filter(c => c.id !== editingCityId);
-  const sameZone = zoneId ? pool.filter(c => c.zoneId === zoneId) : pool;
-  const attackableSides = ATTACK_RULES[mySide] || [];
-  const attackable = sameZone.filter(c => attackableSides.includes(c.side));
-  const defendableSides = DEFEND_RULES[mySide] || [];
-  const defendable = sameZone.filter(c => defendableSides.includes(c.side));
-  const aMap = {}; (attackTargets || []).forEach(t => aMap[t.cityId] = t);
-  const dMap = {}; (defendTargets || []).forEach(t => dMap[t.cityId] = t);
-
-  const buildOptions = (selected) => PERCENT_OPTIONS.map(p => `<option value="${p}" ${p===selected?'selected':''}>${p}%</option>`).join('');
-  const myCityForAI = {
-    avgPower: parseFloat(document.getElementById('cm_avgPower').value) || 1,
-    totalTeams: parseFloat(document.getElementById('cm_totalTeams').value) || 0
-  };
-
-  if(attackable.length === 0){ attackEl.innerHTML = `<div class="empty-hint">無可進攻目標</div>`; }
-  else {
-    attackEl.innerHTML = attackable.map(c => {
-      const cfg = aMap[c.id] || {};
-      const checked = cfg.cityId !== undefined;
-      const pre = cfg.preWarPercent !== undefined ? cfg.preWarPercent : 50;
-      const post = cfg.postRevivePercent !== undefined ? cfg.postRevivePercent : 50;
-      const pr = cfg.priority !== undefined ? cfg.priority : 1;
-      const defStart = c.defStartTime || '19:00';
-      const aiSuggest = AI.suggestForTarget(myCityForAI, c, true);
-      const aiCls = (aiSuggest === 100 && myCityForAI.avgPower < c.avgPower) ? 'ai-hint warn' : 'ai-hint';
-      const a = state.alliances.find(al => al.id === c.allianceId);
-      const icon = (a && a.icon) ? a.icon + ' ' : '';
-      return `<div class="target-item ${checked ? 'checked' : ''}" data-city="${c.id}">
-        <input type="checkbox" class="atk-cb" data-city="${c.id}" ${checked ? 'checked' : ''}>
-        <span class="tname">${icon}${c.isCapital ? '👑 ' : ''}${esc(c.name)}</span>
-        <span class="tside ${sideClass(c.side)}">${sideLabel(c.side)}</span>
-        <span class="tside time">${esc(defStart)}</span>
-        <span class="${aiCls}">🤖 ${aiSuggest}%</span>
-        <div class="target-config-row">
-          <span class="cfg-label">戰前</span>
-          <select class="atk-pre" data-city="${c.id}" ${checked ? '' : 'disabled'}>${buildOptions(pre)}</select>
-          <span class="cfg-label">復活</span>
-          <select class="atk-post" data-city="${c.id}" ${checked ? '' : 'disabled'}>${buildOptions(post)}</select>
-          <span class="cfg-label">順序</span>
-          <input type="number" class="atk-priority" data-city="${c.id}" value="${pr}" min="1" max="99" step="1" ${checked ? '' : 'disabled'}>
-        </div>
-      </div>`;
-    }).join('');
-  }
-  if(defendable.length === 0){
-    defendEl.innerHTML = defendableSides.length === 0 ? '<div class="empty-hint">此陣營不可協防任何城池</div>' : `<div class="empty-hint">無可協防目標</div>`;
-  } else {
-    defendEl.innerHTML = defendable.map(c => {
-      const cfg = dMap[c.id] || {};
-      const checked = cfg.cityId !== undefined;
-      const pre = cfg.preWarPercent !== undefined ? cfg.preWarPercent : 50;
-      const post = cfg.postRevivePercent !== undefined ? cfg.postRevivePercent : 50;
-      const pr = cfg.priority !== undefined ? cfg.priority : 1;
-      const defStart = c.defStartTime || '19:00';
-      const aiSuggest = AI.suggestForTarget(myCityForAI, c, false);
-      const a = state.alliances.find(al => al.id === c.allianceId);
-      const icon = (a && a.icon) ? a.icon + ' ' : '';
-      return `<div class="target-item ${checked ? 'checked' : ''}" data-city="${c.id}">
-        <input type="checkbox" class="def-cb" data-city="${c.id}" ${checked ? 'checked' : ''}>
-        <span class="tname">${icon}${c.isCapital ? '👑 ' : ''}${esc(c.name)}</span>
-        <span class="tside ${sideClass(c.side)}">${sideLabel(c.side)}</span>
-        <span class="tside time">${esc(defStart)}</span>
-        <span class="ai-hint">🤖 ${aiSuggest}%</span>
-        <div class="target-config-row">
-          <span class="cfg-label">戰前</span>
-          <select class="def-pre" data-city="${c.id}" ${checked ? '' : 'disabled'}>${buildOptions(pre)}</select>
-          <span class="cfg-label">復活</span>
-          <select class="def-post" data-city="${c.id}" ${checked ? '' : 'disabled'}>${buildOptions(post)}</select>
-          <span class="cfg-label">順序</span>
-          <input type="number" class="def-priority" data-city="${c.id}" value="${pr}" min="1" max="99" step="1" ${checked ? '' : 'disabled'}>
-        </div>
-      </div>`;
-    }).join('');
-  }
-
-  const bindToggle = (cbSelector, itemSelector, selects, priorityEl) => {
-    document.querySelectorAll(cbSelector).forEach(cb => cb.addEventListener('change', function(){
-      const item = this.closest(itemSelector);
-      item.classList.toggle('checked', this.checked);
-      item.querySelectorAll(selects).forEach(s => s.disabled = !this.checked);
-      item.querySelector(priorityEl).disabled = !this.checked;
-      updateAllocPanel();
-    }));
-  };
-  bindToggle('.atk-cb', '.target-item', '.atk-pre,.atk-post', '.atk-priority');
-  bindToggle('.def-cb', '.target-item', '.def-pre,.def-post', '.def-priority');
-  document.querySelectorAll('.atk-pre,.def-pre').forEach(el => el.addEventListener('change', updateAllocPanel));
-  updateAllocPanel();
-}
-function collectCurrentTargets(){
-  const atk = [], def = [];
-  document.querySelectorAll('.atk-cb:checked').forEach(cb => {
-    const cityId = cb.dataset.city;
-    const pre = parseFloat(document.querySelector(`.atk-pre[data-city="${cityId}"]`).value) || 0;
-    const post = parseFloat(document.querySelector(`.atk-post[data-city="${cityId}"]`).value) || 0;
-    const pr = parseInt(document.querySelector(`.atk-priority[data-city="${cityId}"]`).value) || 1;
-    if(pre > 0) atk.push({ cityId, preWarPercent: pre, postRevivePercent: post, priority: pr });
-  });
-  document.querySelectorAll('.def-cb:checked').forEach(cb => {
-    const cityId = cb.dataset.city;
-    const pre = parseFloat(document.querySelector(`.def-pre[data-city="${cityId}"]`).value) || 0;
-    const post = parseFloat(document.querySelector(`.def-post[data-city="${cityId}"]`).value) || 0;
-    const pr = parseInt(document.querySelector(`.def-priority[data-city="${cityId}"]`).value) || 1;
-    if(pre > 0) def.push({ cityId, preWarPercent: pre, postRevivePercent: post, priority: pr });
-  });
-  return {attackTargets:atk, defendTargets:def};
-}
-function applyAISuggestion(){
-  const currentCity = {
-    avgPower: parseFloat(document.getElementById('cm_avgPower').value) || 1,
-    totalTeams: parseFloat(document.getElementById('cm_totalTeams').value) || 0,
-    attackTargets: [],
-    defendTargets: [],
-  };
-  if (!currentCity.totalTeams){ alert('請先輸入總隊數'); return; }
-  const currentAtk = [], currentDef = [];
-  document.querySelectorAll('.atk-cb:checked').forEach(cb => {
-    const cityId = cb.dataset.city;
-    const pre = parseFloat(document.querySelector(`.atk-pre[data-city="${cityId}"]`).value) || 0;
-    const pr = parseInt(document.querySelector(`.atk-priority[data-city="${cityId}"]`).value) || 1;
-    if (pre > 0) currentAtk.push({ cityId, priority: pr });
-  });
-  document.querySelectorAll('.def-cb:checked').forEach(cb => {
-    const cityId = cb.dataset.city;
-    const pre = parseFloat(document.querySelector(`.def-pre[data-city="${cityId}"]`).value) || 0;
-    const pr = parseInt(document.querySelector(`.def-priority[data-city="${cityId}"]`).value) || 1;
-    if (pre > 0) currentDef.push({ cityId, priority: pr });
-  });
-  if (currentAtk.length === 0 && currentDef.length === 0){
-    alert('請先勾選至少一個進攻或協防目標'); return;
-  }
-  currentCity.attackTargets = currentAtk;
-  currentCity.defendTargets = currentDef;
-  const suggestion = AI.suggestForCity(currentCity, state.cities);
-  for (const s of suggestion.atk){
-    const preEl = document.querySelector(`.atk-pre[data-city="${s.cityId}"]`);
-    const postEl = document.querySelector(`.atk-post[data-city="${s.cityId}"]`);
-    if (preEl) preEl.value = s.preWarPercent;
-    if (postEl) postEl.value = s.postRevivePercent;
-  }
-  for (const s of suggestion.def){
-    const preEl = document.querySelector(`.def-pre[data-city="${s.cityId}"]`);
-    const postEl = document.querySelector(`.def-post[data-city="${s.cityId}"]`);
-    if (preEl) preEl.value = s.preWarPercent;
-    if (postEl) postEl.value = s.postRevivePercent;
-  }
-  updateAllocPanel();
-  logSystem('🤖 AI 佈兵建議已套用');
-}
-function openCityModal(cityId){
-  editingCityId = cityId || null;
-  const isNew = !editingCityId;
-  const city = isNew ? null : state.cities.find(c => c.id === editingCityId);
-  if(!isNew && isConnected()) publish({ type:'edit_lock', cityId:editingCityId, name:state.commanderName, clientId:state.myClientId });
-  document.getElementById('cityModalTitle').textContent = isNew ? '🏰 新增城池' : `✏️ 編輯城池：${city ? city.name : ''}`;
-  const zoneSel = document.getElementById('cm_zone');
-  zoneSel.innerHTML = state.zones.map(z => `<option value="${z.id}">${esc(z.name)}</option>`).join('') || '<option value="">（尚未建立戰區）</option>';
-  const allianceSel = document.getElementById('cm_alliance');
-  allianceSel.innerHTML = '<option value="">（不指定）</option>' + state.alliances.map(a => `<option value="${a.id}">${a.icon ? a.icon + ' ' : ''}${esc(a.name)}（${allianceSideLabel(a.side)}）</option>`).join('');
-  if(isNew){
-    document.getElementById('cm_name').value = '';
-    document.getElementById('cm_side').value = 'self';
-    document.getElementById('cm_totalPower').value = 100000;
-    document.getElementById('cm_totalTeams').value = 100;
-    document.getElementById('cm_cooldownMin').value = 5;
-    document.getElementById('cm_wallMin').value = 30;
-    document.getElementById('cm_defStartTime').value = '19:00';
-    document.getElementById('cm_isCapital').checked = false;
-    if(state.zones.length > 0) zoneSel.value = state.zones[0].id;
-  } else {
-    document.getElementById('cm_name').value = city.name;
-    document.getElementById('cm_zone').value = city.zoneId || '';
-    document.getElementById('cm_alliance').value = city.allianceId || '';
-    document.getElementById('cm_side').value = city.side;
-    document.getElementById('cm_totalPower').value = city.totalPower;
-    document.getElementById('cm_totalTeams').value = city.totalTeams;
-    document.getElementById('cm_cooldownMin').value = city.cooldownMin;
-    document.getElementById('cm_wallMin').value = city.wallMin;
-    document.getElementById('cm_defStartTime').value = city.defStartTime || '19:00';
-    document.getElementById('cm_isCapital').checked = !!city.isCapital;
-  }
-  updateAutoCalcFields(); updateSectionLabels();
-  renderTargetSelectors(city ? (city.attackTargets || []) : [], city ? (city.defendTargets || []) : []);
-  document.getElementById('cityModal').classList.add('show');
-}
-function closeCityModal(){
-  if(editingCityId && isConnected()) publish({ type:'edit_unlock', cityId:editingCityId, clientId:state.myClientId });
-  delete state.editLocks[editingCityId];
-  document.getElementById('cityModal').classList.remove('show');
-  editingCityId = null;
-  R.renderCities();
-  if (document.getElementById('tab-deploy').classList.contains('active')) DEPLOY.render();
-}
-function saveCityFromModal(){
-  const name = document.getElementById('cm_name').value.trim();
-  if(!name){ alert('請輸入城池名稱'); return; }
-  const zoneId = document.getElementById('cm_zone').value;
-  if(!zoneId){ alert('請先建立並選擇戰區'); return; }
-  const allianceId = document.getElementById('cm_alliance').value;
-  const side = document.getElementById('cm_side').value;
-  const totalPower = parseFloat(document.getElementById('cm_totalPower').value) || 0;
-  const totalTeams = parseFloat(document.getElementById('cm_totalTeams').value) || 0;
-  const cooldownMin = parseFloat(document.getElementById('cm_cooldownMin').value) || 0;
-  const wallMin = parseFloat(document.getElementById('cm_wallMin').value) || 0;
-  const defStartTime = document.getElementById('cm_defStartTime').value || '19:00';
-  const isCapital = document.getElementById('cm_isCapital').checked;
-  const {attackTargets, defendTargets} = collectCurrentTargets();
-  const avgPower = totalTeams > 0 ? Math.floor(totalPower / totalTeams) : 0;
-  const id = editingCityId || uid();
-  if(isCapital && allianceId){
-    state.cities.forEach(c => { if(c.allianceId === allianceId && c.isCapital && c.id !== id){ c.isCapital = false; state.entityRev.city[c.id] = (state.entityRev.city[c.id] || 0) + 1; markDirty('city', c.id); } });
-  }
-  const entity = { id, name, zoneId, allianceId, side, totalPower, totalTeams, avgPower, cooldownMin, wallMin, defStartTime, isCapital, attackTargets, defendTargets };
-  upsertEntity('city', entity);
-  closeCityModal();
-  R.renderCities();
-  saveState();
-}
-
-/* ============ 模擬調度 ============ */
-function collectCitiesForSim(zoneId){ return zoneId === 'all' ? state.cities : state.cities.filter(c => c.zoneId === zoneId); }
-function executeSimulation(zoneId){
-  if(state.isSimulating) return;
-  const timeLimitMin = parseInt(document.getElementById('globalTimeLimit').value) || 120;
-  const consumeMinPerMin = parseFloat(document.getElementById('globalConsumeMinPerMin').value) || 10;
-  const consumeMaxPerMin = parseFloat(document.getElementById('globalConsumeMaxPerMin').value) || 30;
-  const siegeEfficiency = parseFloat(document.getElementById('globalSiegeEfficiency').value) || 1;
-  const marchTimeSec = parseInt(document.getElementById('globalMarchTimeSec').value) || 0;
-  const maxLossRatio = (parseFloat(document.getElementById('globalMaxLossRatio').value) || 90) / 100;
-  const minLossRatio = (parseFloat(document.getElementById('globalMinLossRatio').value) || 10) / 100;
-  Object.assign(state.settings, { timeLimitMin, consumeMinPerMin, consumeMaxPerMin, siegeEfficiency, marchTimeSec, maxLossRatio, minLossRatio });
-  state.settingsRev++;
-  saveState();
-
-  const cities = collectCitiesForSim(zoneId);
-  if(cities.length === 0){ logSystem('❌ 無城池資料'); return; }
-  const v = validateCrossDay(cities, timeLimitMin);
-  if(!v.ok){ logSystem('❌ ' + v.msg); return; }
-  const defStartMins = cities.map(c => hhmmToMinutes(c.defStartTime || '19:00'));
-  state.simBaseMin = Math.min(...defStartMins);
-  state.isSimulating = true;
-  state.dynRows = []; state.narrativeLines = [];
-  document.getElementById('narrativeOutput').innerHTML = '推演中...';
-  DYN.setRows([]); viz.reset(); R.renderProgress(0);
-  const runId = ++simRunId;
-  const maxDefStartRel = Math.max(...defStartMins) - state.simBaseMin;
-  const maxSec = maxDefStartRel * 60 + timeLimitMin * 60;
-  const snapshotSet = viz.getSchedule(maxSec);
-  const dynSet = new Set();
-  for(let s=0;s<=maxSec;s+=DYN_ROUTE_SAMPLE_SEC) dynSet.add(s);
-  dynSet.add(maxSec);
-  const dynRowsBuffer = [];
-  const worker = getWorker();
-  if(worker){
-    const onMessage = (e) => {
-      const msg = e.data || {};
-      if(msg.runId !== runId) return;
-      switch(msg.type){
-        case 'progress': R.renderDebug({msg:`⏳ ${Math.round(msg.progress*100)}%`}); R.renderProgress(msg.progress); break;
-        case 'snapshot': viz.ingestSnapshot(msg.sec, msg.snap); break;
-        case 'dyn_sample': if(msg.rows) for(const r of msg.rows) dynRowsBuffer.push(r); break;
-        case 'done': worker.removeEventListener('message', onMessage); state.dynRows = dynRowsBuffer; handleSimulationDone(msg.result); break;
-        case 'error': worker.removeEventListener('message', onMessage); logSystem('❌ 推演失敗：' + msg.error); state.isSimulating = false; break;
-      }
-    };
-    worker.addEventListener('message', onMessage);
-    worker.postMessage({ type:'run', payload:{ cities: JSON.parse(JSON.stringify(cities)), settings: {...state.settings}, snapshotsAt: snapshotSet, dynSampleAt: [...dynSet], runId } });
-    return;
-  }
-  setTimeout(async () => {
-    try{
-      const result = await runSimulation(JSON.parse(JSON.stringify(cities)), {...state.settings}, {
-        onProgress: ({progress}) => { R.renderProgress(progress); R.renderDebug({msg:`⏳ ${Math.round(progress*100)}%`}); },
-        onSnapshot: (sec, snap) => viz.ingestSnapshot(sec, snap),
-        snapshotAt: new Set(snapshotSet),
-        dynSampleAt: new Set(dynSet),
-        onDynSample: (sec, rows) => { for(const r of rows) dynRowsBuffer.push(r); },
-      });
-      state.dynRows = dynRowsBuffer;
-      handleSimulationDone(result);
-    }catch(err){ console.error(err); state.isSimulating = false; }
-  }, 30);
-}
-function handleSimulationDone(result){
-  R.renderProgress(1);
-  setTimeout(() => R.renderProgress(0), 1000);
-  if(result.aborted){ logSystem('⛔ 推演已中止'); state.isSimulating = false; return; }
-  if(result.minDefStartMin !== undefined) state.simBaseMin = result.minDefStartMin;
-  state.narrativeLines = result.narrativeLines || [];
-  R.renderNarrative(state.narrativeLines);
-  DYN.setRows(state.dynRows);
-  DYN.populateCityFilters();
-  saveState();
-  if(state.isHost && isConnected()){
-    const vizPayload = JSON.stringify(viz.getAllSnapshots());
-    const totalV = Math.ceil(vizPayload.length / VIZ_CHUNK_SIZE) || 1;
-    for(let i=0;i<totalV;i++) publish({ type:'viz_chunk', part:i, total:totalV, data: vizPayload.slice(i*VIZ_CHUNK_SIZE, (i+1)*VIZ_CHUNK_SIZE) });
-    const dynPayload = JSON.stringify(state.dynRows);
-    const totalD = Math.ceil(dynPayload.length / 6000) || 1;
-    for(let i=0;i<totalD;i++) publish({ type:'dyn_chunk', part:i, total:totalD, data: dynPayload.slice(i*6000, (i+1)*6000) });
-  }
-  viz.finalize();
-  state.isSimulating = false;
-  logSystem('✅ 推演完成');
-}
 /* ============ 佈兵總覽 ============ */
 const DEPLOY = (() => {
   let currentView = 'attack';
@@ -2316,7 +2000,7 @@ const DEPLOY = (() => {
     return el;
   }
 
-    function renderGraphView(cities, conflictMap){
+  function renderGraphView(cities, conflictMap){
     const wrap = document.getElementById('deployTableWrap');
     const activeCities = cities.filter(c => {
       const hasOut = (c.attackTargets||[]).some(t => (t.preWarPercent||0)>0) || (c.defendTargets||[]).some(t => (t.preWarPercent||0)>0);
@@ -2357,7 +2041,6 @@ const DEPLOY = (() => {
 
     svg.appendChild(makeDefs(ns));
 
-    // 戰區框
     if (layoutMode === 'zone' && zones.length > 0){
       const zoneG = document.createElementNS(ns, 'g');
       zoneG.setAttribute('class', 'graph-zones');
@@ -2387,7 +2070,6 @@ const DEPLOY = (() => {
       svg.appendChild(zoneG);
     }
 
-    // 連線
     const edgesG = document.createElementNS(ns, 'g');
     edgesG.setAttribute('class', 'graph-edges');
 
@@ -2418,7 +2100,6 @@ const DEPLOY = (() => {
     }
     svg.appendChild(edgesG);
 
-    // 節點
     const nodesG = document.createElementNS(ns, 'g');
     nodesG.setAttribute('class', 'graph-nodes');
 
@@ -2434,7 +2115,6 @@ const DEPLOY = (() => {
       g.setAttribute('class', 'graph-node-group');
       g.dataset.cityId = c.id;
 
-      // 衝突光環
       if (info.conflict){
         const halo = document.createElementNS(ns, 'circle');
         halo.setAttribute('cx', pos.x);
@@ -2454,10 +2134,9 @@ const DEPLOY = (() => {
         g.appendChild(halo);
       }
 
-      // 節點底層形狀（依 side：圓/方/三角/菱/六邊）
       g.appendChild(makeNodeShape(ns, c.side, pos.x, pos.y, r));
 
-      // 有盟徽 → 加一層深色底盤讓 emoji 更清楚
+      // 盟徽底盤
       if (hasIcon){
         const bg = document.createElementNS(ns, 'circle');
         bg.setAttribute('cx', pos.x);
@@ -2468,7 +2147,6 @@ const DEPLOY = (() => {
         g.appendChild(bg);
       }
 
-      // 首都皇冠
       if (c.isCapital){
         const crown = document.createElementNS(ns, 'text');
         crown.setAttribute('x', pos.x);
@@ -2479,7 +2157,6 @@ const DEPLOY = (() => {
         g.appendChild(crown);
       }
 
-      // 節點中央：有盟徽 → 顯示 emoji；否則 → 顯示兵力數字
       if (hasIcon){
         const iconText = document.createElementNS(ns, 'text');
         iconText.setAttribute('x', pos.x);
@@ -2504,13 +2181,10 @@ const DEPLOY = (() => {
         g.appendChild(numLabel);
       }
 
-      // 名稱標籤（節點下方）
       const label = document.createElementNS(ns, 'text');
       label.setAttribute('class', 'graph-node-label' + (c.name.length > 4 ? ' small' : ''));
       label.setAttribute('x', pos.x);
       label.setAttribute('y', pos.y + r + 16);
-      // 有盟徽 → 名稱後面加「(兵力)」，因為中央被 emoji 佔用
-      // 沒盟徽 → 只顯示名稱
       label.textContent = (c.name.length > 8 ? c.name.slice(0,8)+'…' : c.name) + (hasIcon ? ` (${c.totalTeams})` : '');
       g.appendChild(label);
 
@@ -2518,13 +2192,11 @@ const DEPLOY = (() => {
     }
     svg.appendChild(nodesG);
 
-    // 資訊面板
     const infoPanel = document.createElement('div');
     infoPanel.className = 'graph-info-panel';
     infoPanel.style.display = 'none';
     infoPanel.innerHTML = '<div class="title"></div><div class="body"></div>';
 
-    // 圖例
     const legend = document.createElement('div');
     legend.className = 'graph-legend';
     legend.innerHTML = `
@@ -2538,7 +2210,6 @@ const DEPLOY = (() => {
       <span style="color:var(--text-dim);">★ 節點中央 = 盟徽</span>
     `;
 
-    // 縮放按鈕
     const zoomCtrl = document.createElement('div');
     zoomCtrl.className = 'graph-zoom';
     zoomCtrl.innerHTML = `
@@ -2556,7 +2227,6 @@ const DEPLOY = (() => {
     graphWrap.appendChild(zoomCtrl);
     wrap.appendChild(graphWrap);
 
-    // 縮放與平移
     let vb = { x: 0, y: 0, w: W, h: H };
     function applyVB(){ svg.setAttribute('viewBox', `${vb.x} ${vb.y} ${vb.w} ${vb.h}`); }
     zoomCtrl.querySelector('[data-zoom="in"]').addEventListener('click', () => {
@@ -2608,7 +2278,6 @@ const DEPLOY = (() => {
       applyVB();
     }, { passive: false });
 
-    // 懸停高亮
     const allNodeGroups = nodesG.querySelectorAll('.graph-node-group');
     const allEdges = edgesG.querySelectorAll('.graph-edge');
 
@@ -2809,6 +2478,559 @@ const DEPLOY = (() => {
   return { init, render, populateZoneFilter };
 })();
 
+/* ============ 沙盤匯出/匯入/分享 ============ */
+let pendingImportData = null;
+
+function exportSandboxJSON(){
+  const data = {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    exportedBy: state.commanderName || '匿名',
+    settings: { ...state.settings },
+    alliances: JSON.parse(JSON.stringify(state.alliances)),
+    zones: JSON.parse(JSON.stringify(state.zones)),
+    cities: JSON.parse(JSON.stringify(state.cities)),
+  };
+  const json = JSON.stringify(data, null, 2);
+  const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const safeName = (state.commanderName || '匿名').replace(/[\\/:*?"<>|]/g, '_');
+  a.href = url;
+  a.download = `沙盤_${new Date().toISOString().slice(0,10)}_${safeName}.json`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  logSystem(`📤 已匯出沙盤`);
+  alert('✅ 匯出成功！檔案已下載。');
+}
+
+function importSandboxJSON(file){
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try{
+      const data = JSON.parse(e.target.result);
+      if (!data.alliances || !data.zones || !data.cities){
+        alert('❌ 檔案格式錯誤');
+        return;
+      }
+      pendingImportData = data;
+      const info = 
+        `匯入者：${data.exportedBy || '未知'}\n` +
+        `匯出時間：${data.exportedAt ? new Date(data.exportedAt).toLocaleString() : '未知'}\n\n` +
+        `同盟：${data.alliances.length} 個\n` +
+        `戰區：${data.zones.length} 個\n` +
+        `城池：${data.cities.length} 座\n\n` +
+        `請選擇匯入模式：`;
+      document.getElementById('importModalInfo').textContent = info;
+      document.getElementById('importModal').classList.add('show');
+    }catch(err){
+      alert('❌ 檔案解析失敗：' + err.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+function applyImport(mode){
+  if (!pendingImportData) return;
+  const data = pendingImportData;
+  if (mode === 'overwrite'){
+    state.alliances = data.alliances || [];
+    state.zones = data.zones || [];
+    state.cities = data.cities || [];
+    if (data.settings) Object.assign(state.settings, data.settings);
+  } else {
+    const mergeById = (local, incoming) => {
+      const map = new Map(local.map(x => [x.id, x]));
+      for(const ent of incoming) map.set(ent.id, ent);
+      return [...map.values()];
+    };
+    state.alliances = mergeById(state.alliances, data.alliances || []);
+    state.zones = mergeById(state.zones, data.zones || []);
+    state.cities = mergeById(state.cities, data.cities || []);
+  }
+  const ensureRev = (kind, arr) => {
+    for(const ent of arr){ if (!state.entityRev[kind][ent.id]) state.entityRev[kind][ent.id] = 0; }
+  };
+  ensureRev('alliance', state.alliances);
+  ensureRev('zone', state.zones);
+  ensureRev('city', state.cities);
+  saveState();
+  R.renderAll();
+  DYN.populateCityFilters();
+  DEPLOY.populateZoneFilter();
+  if (document.getElementById('tab-deploy').classList.contains('active')) DEPLOY.render();
+  document.getElementById('importModal').classList.remove('show');
+  pendingImportData = null;
+  logSystem(`📥 已匯入沙盤（${mode === 'overwrite' ? '覆蓋' : '合併'}）`);
+  alert('✅ 匯入完成！');
+}
+
+function generateShareLink(){
+  const data = { v: 1, s: state.settings, a: state.alliances, z: state.zones, c: state.cities };
+  const json = JSON.stringify(data);
+  const compressed = LZString.compressToEncodedURIComponent(json);
+  const baseUrl = location.origin + location.pathname;
+  const url = baseUrl + '#sandbox=' + compressed;
+  document.getElementById('shareLinkDisplay').value = url;
+  logSystem(`🔗 已生成分享連結（長度 ${url.length} 字元）`);
+  if (url.length > 8000){ alert('⚠️ 連結過長，建議改用「檔案協作」。'); }
+}
+
+function copyShareLink(){
+  const el = document.getElementById('shareLinkDisplay');
+  if (!el.value){ alert('請先點擊「生成分享連結」'); return; }
+  const fallbackCopy = (inputEl) => {
+    inputEl.select();
+    try{ document.execCommand('copy'); alert('📋 已複製連結！'); }
+    catch(e){ alert('❌ 複製失敗，請手動複製'); }
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(el.value).then(() => alert('📋 已複製連結！')).catch(() => fallbackCopy(el));
+  } else {
+    fallbackCopy(el);
+  }
+}
+
+function loadFromShareLink(){
+  const hash = location.hash;
+  if (!hash.startsWith('#sandbox=')) return false;
+  const compressed = hash.slice('#sandbox='.length);
+  try{
+    const json = LZString.decompressFromEncodedURIComponent(compressed);
+    if (!json){ logSystem('⚠️ 分享連結解析失敗'); return false; }
+    const data = JSON.parse(json);
+    if (!data.a || !data.z || !data.c){ logSystem('⚠️ 分享連結格式錯誤'); return false; }
+    state.alliances = data.a;
+    state.zones = data.z;
+    state.cities = data.c;
+    if (data.s) Object.assign(state.settings, data.s);
+    const ensureRev = (kind, arr) => { for(const ent of arr){ if(!state.entityRev[kind][ent.id]) state.entityRev[kind][ent.id] = 0; } };
+    ensureRev('alliance', state.alliances);
+    ensureRev('zone', state.zones);
+    ensureRev('city', state.cities);
+    saveState();
+    logSystem(`🔗 已從分享連結載入沙盤`);
+    history.replaceState(null, '', location.pathname + location.search);
+    return true;
+  }catch(e){
+    console.warn(e);
+    return false;
+  }
+}
+
+/* ============ 同盟表單 ============ */
+function updateAllianceAvgPowerPreview(){
+  const mc = parseFloat(document.getElementById('allyMemberCount').value) || 0;
+  const tp = parseFloat(document.getElementById('allyTotalPower').value) || 0;
+  document.getElementById('allyAvgPower').value = mc > 0 ? (tp / mc).toLocaleString(undefined,{maximumFractionDigits:2}) : '0';
+}
+function resetAllianceForm(){
+  state.editingAllianceId = null;
+  document.getElementById('allyFormTitle').textContent = '➕ 新增同盟';
+  document.getElementById('allyName').value = '';
+  document.getElementById('allyIcon').value = '';
+  document.getElementById('allySide').value = 'ally';
+  document.getElementById('allyMemberCount').value = 100;
+  document.getElementById('allyTotalPower').value = 20000;
+  document.getElementById('btnCancelAllianceEdit').style.display = 'none';
+  document.getElementById('btnSaveAlliance').textContent = '💾 儲存';
+  updateAllianceAvgPowerPreview();
+  R.renderAlliances();
+}
+function startEditAlliance(id){
+  const a = state.alliances.find(x => x.id === id);
+  if(!a) return;
+  state.editingAllianceId = id;
+  document.getElementById('allyFormTitle').textContent = `✏️ 編輯同盟：${esc(a.name)}`;
+  document.getElementById('allyName').value = a.name || '';
+  document.getElementById('allyIcon').value = a.icon || '';
+  document.getElementById('allySide').value = a.side || 'ally';
+  document.getElementById('allyMemberCount').value = a.memberCount || 100;
+  document.getElementById('allyTotalPower').value = a.totalPower || 20000;
+  document.getElementById('btnCancelAllianceEdit').style.display = 'inline-flex';
+  document.getElementById('btnSaveAlliance').textContent = '💾 更新';
+  updateAllianceAvgPowerPreview();
+  R.renderAlliances();
+}
+
+/* ============ AI 參數 UI ============ */
+function syncAIParamsToUI(){
+  const p = AI.getParams();
+  document.getElementById('aiR25').value = p.r25;
+  document.getElementById('aiR20').value = p.r20;
+  document.getElementById('aiR15').value = p.r15;
+  document.getElementById('aiR12').value = p.r12;
+  document.getElementById('aiR10').value = p.r10;
+  document.getElementById('aiR08').value = p.r08;
+  document.getElementById('aiR06').value = p.r06;
+  document.getElementById('aiR00').value = p.r00;
+  document.getElementById('aiTeamFactor').value = p.teamFactor;
+  document.getElementById('aiWallFactor1').value = p.wallFactor1;
+  document.getElementById('aiWallFactor2').value = p.wallFactor2;
+  document.getElementById('aiDefendFactor').value = p.defendFactor;
+  document.getElementById('aiMinPct').value = p.minPct;
+}
+function readAIParamsFromUI(){
+  return {
+    r25: parseFloat(document.getElementById('aiR25').value) || 25,
+    r20: parseFloat(document.getElementById('aiR20').value) || 33,
+    r15: parseFloat(document.getElementById('aiR15').value) || 50,
+    r12: parseFloat(document.getElementById('aiR12').value) || 60,
+    r10: parseFloat(document.getElementById('aiR10').value) || 70,
+    r08: parseFloat(document.getElementById('aiR08').value) || 84,
+    r06: parseFloat(document.getElementById('aiR06').value) || 95,
+    r00: parseFloat(document.getElementById('aiR00').value) || 100,
+    teamFactor: parseFloat(document.getElementById('aiTeamFactor').value) || 0.4,
+    wallFactor1: parseFloat(document.getElementById('aiWallFactor1').value) || 1.10,
+    wallFactor2: parseFloat(document.getElementById('aiWallFactor2').value) || 1.15,
+    defendFactor: parseFloat(document.getElementById('aiDefendFactor').value) || 0.70,
+    minPct: parseFloat(document.getElementById('aiMinPct').value) || 17,
+  };
+}
+
+/* ============ UI 核心 ============ */
+let editingCityId = null;
+let confirmCb = null;
+function showConfirm(title, msg, cb){ document.getElementById('modalTitle').textContent = '⚠️ ' + title; document.getElementById('modalMessage').textContent = msg; document.getElementById('confirmModal').classList.add('show'); confirmCb = cb; }
+
+function validateCrossDay(cities, timeLimitMin){
+  if(cities.length === 0) return {ok:true};
+  const mins = cities.map(c => hhmmToMinutes(c.defStartTime || '19:00'));
+  if((Math.max(...mins) - Math.min(...mins)) + timeLimitMin > 1440) return { ok: false, msg: `時間跨度 + 時長超過 24 小時。` };
+  return {ok:true};
+}
+function updateSectionLabels(){
+  const mySide = document.getElementById('cm_side').value;
+  const atkSides = (ATTACK_RULES[mySide] || []).map(sideLabel).join(' / ');
+  const defSides = (DEFEND_RULES[mySide] || []).map(sideLabel).join(' / ');
+  document.getElementById('attackSectionLabel').textContent = `⚔️ 選擇進攻的城池（限 ${atkSides || '無'}）`;
+  document.getElementById('defendSectionLabel').textContent = `🛡️ 選擇協防的城池${defSides ? `（限 ${defSides}）` : '（不可協防）'}`;
+}
+function updateAutoCalcFields(){
+  const t = parseFloat(document.getElementById('cm_totalTeams').value)||0;
+  const p = parseFloat(document.getElementById('cm_totalPower').value)||0;
+  document.getElementById('cm_avgPower').value = t > 0 ? Math.floor(p/t) : 0;
+}
+function updateAllocPanel(){
+  const total = parseFloat(document.getElementById('cm_totalTeams').value) || 0;
+  let atkSum = 0, defSum = 0;
+  document.querySelectorAll('.atk-cb:checked').forEach(cb => { const sel = document.querySelector(`.atk-pre[data-city="${cb.dataset.city}"]`); atkSum += Math.floor(total * (parseFloat(sel.value)||0) / 100); });
+  document.querySelectorAll('.def-cb:checked').forEach(cb => { const sel = document.querySelector(`.def-pre[data-city="${cb.dataset.city}"]`); defSum += Math.floor(total * (parseFloat(sel.value)||0) / 100); });
+  const allocated = atkSum + defSum, reserve = total - allocated;
+  document.getElementById('cm_allocTotal').textContent = total;
+  document.getElementById('cm_allocAtk').textContent = atkSum;
+  document.getElementById('cm_allocDef').textContent = defSum;
+  const reserveEl = document.getElementById('cm_allocReserve');
+  reserveEl.textContent = reserve;
+  reserveEl.style.color = reserve < 0 ? 'var(--neon-red)' : 'var(--neon-green)';
+  document.getElementById('cm_allocWarning').style.display = reserve < 0 ? 'block' : 'none';
+}
+function renderTargetSelectors(attackTargets, defendTargets){
+  const zoneId = document.getElementById('cm_zone').value, mySide = document.getElementById('cm_side').value;
+  const attackEl = document.getElementById('cm_attackList'), defendEl = document.getElementById('cm_defendList');
+  const pool = state.cities.filter(c => c.id !== editingCityId);
+  const sameZone = zoneId ? pool.filter(c => c.zoneId === zoneId) : pool;
+  const attackableSides = ATTACK_RULES[mySide] || [];
+  const attackable = sameZone.filter(c => attackableSides.includes(c.side));
+  const defendableSides = DEFEND_RULES[mySide] || [];
+  const defendable = sameZone.filter(c => defendableSides.includes(c.side));
+  const aMap = {}; (attackTargets || []).forEach(t => aMap[t.cityId] = t);
+  const dMap = {}; (defendTargets || []).forEach(t => dMap[t.cityId] = t);
+
+  const buildOptions = (selected) => PERCENT_OPTIONS.map(p => `<option value="${p}" ${p===selected?'selected':''}>${p}%</option>`).join('');
+  const myCityForAI = {
+    avgPower: parseFloat(document.getElementById('cm_avgPower').value) || 1,
+    totalTeams: parseFloat(document.getElementById('cm_totalTeams').value) || 0
+  };
+
+  if(attackable.length === 0){ attackEl.innerHTML = `<div class="empty-hint">無可進攻目標</div>`; }
+  else {
+    attackEl.innerHTML = attackable.map(c => {
+      const cfg = aMap[c.id] || {};
+      const checked = cfg.cityId !== undefined;
+      const pre = cfg.preWarPercent !== undefined ? cfg.preWarPercent : 50;
+      const post = cfg.postRevivePercent !== undefined ? cfg.postRevivePercent : 50;
+      const pr = cfg.priority !== undefined ? cfg.priority : 1;
+      const defStart = c.defStartTime || '19:00';
+      const aiSuggest = AI.suggestForTarget(myCityForAI, c, true);
+      const aiCls = (aiSuggest === 100 && myCityForAI.avgPower < c.avgPower) ? 'ai-hint warn' : 'ai-hint';
+      const a = state.alliances.find(al => al.id === c.allianceId);
+      const icon = (a && a.icon) ? a.icon + ' ' : '';
+      return `<div class="target-item ${checked ? 'checked' : ''}" data-city="${c.id}">
+        <input type="checkbox" class="atk-cb" data-city="${c.id}" ${checked ? 'checked' : ''}>
+        <span class="tname">${icon}${c.isCapital ? '👑 ' : ''}${esc(c.name)}</span>
+        <span class="tside ${sideClass(c.side)}">${sideLabel(c.side)}</span>
+        <span class="tside time">${esc(defStart)}</span>
+        <span class="${aiCls}">🤖 ${aiSuggest}%</span>
+        <div class="target-config-row">
+          <span class="cfg-label">戰前</span>
+          <select class="atk-pre" data-city="${c.id}" ${checked ? '' : 'disabled'}>${buildOptions(pre)}</select>
+          <span class="cfg-label">復活</span>
+          <select class="atk-post" data-city="${c.id}" ${checked ? '' : 'disabled'}>${buildOptions(post)}</select>
+          <span class="cfg-label">順序</span>
+          <input type="number" class="atk-priority" data-city="${c.id}" value="${pr}" min="1" max="99" step="1" ${checked ? '' : 'disabled'}>
+        </div>
+      </div>`;
+    }).join('');
+  }
+  if(defendable.length === 0){
+    defendEl.innerHTML = defendableSides.length === 0 ? '<div class="empty-hint">此陣營不可協防任何城池</div>' : `<div class="empty-hint">無可協防目標</div>`;
+  } else {
+    defendEl.innerHTML = defendable.map(c => {
+      const cfg = dMap[c.id] || {};
+      const checked = cfg.cityId !== undefined;
+      const pre = cfg.preWarPercent !== undefined ? cfg.preWarPercent : 50;
+      const post = cfg.postRevivePercent !== undefined ? cfg.postRevivePercent : 50;
+      const pr = cfg.priority !== undefined ? cfg.priority : 1;
+      const defStart = c.defStartTime || '19:00';
+      const aiSuggest = AI.suggestForTarget(myCityForAI, c, false);
+      const a = state.alliances.find(al => al.id === c.allianceId);
+      const icon = (a && a.icon) ? a.icon + ' ' : '';
+      return `<div class="target-item ${checked ? 'checked' : ''}" data-city="${c.id}">
+        <input type="checkbox" class="def-cb" data-city="${c.id}" ${checked ? 'checked' : ''}>
+        <span class="tname">${icon}${c.isCapital ? '👑 ' : ''}${esc(c.name)}</span>
+        <span class="tside ${sideClass(c.side)}">${sideLabel(c.side)}</span>
+        <span class="tside time">${esc(defStart)}</span>
+        <span class="ai-hint">🤖 ${aiSuggest}%</span>
+        <div class="target-config-row">
+          <span class="cfg-label">戰前</span>
+          <select class="def-pre" data-city="${c.id}" ${checked ? '' : 'disabled'}>${buildOptions(pre)}</select>
+          <span class="cfg-label">復活</span>
+          <select class="def-post" data-city="${c.id}" ${checked ? '' : 'disabled'}>${buildOptions(post)}</select>
+          <span class="cfg-label">順序</span>
+          <input type="number" class="def-priority" data-city="${c.id}" value="${pr}" min="1" max="99" step="1" ${checked ? '' : 'disabled'}>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  const bindToggle = (cbSelector, itemSelector, selects, priorityEl) => {
+    document.querySelectorAll(cbSelector).forEach(cb => cb.addEventListener('change', function(){
+      const item = this.closest(itemSelector);
+      item.classList.toggle('checked', this.checked);
+      item.querySelectorAll(selects).forEach(s => s.disabled = !this.checked);
+      item.querySelector(priorityEl).disabled = !this.checked;
+      updateAllocPanel();
+    }));
+  };
+  bindToggle('.atk-cb', '.target-item', '.atk-pre,.atk-post', '.atk-priority');
+  bindToggle('.def-cb', '.target-item', '.def-pre,.def-post', '.def-priority');
+  document.querySelectorAll('.atk-pre,.def-pre').forEach(el => el.addEventListener('change', updateAllocPanel));
+  updateAllocPanel();
+}
+function collectCurrentTargets(){
+  const atk = [], def = [];
+  document.querySelectorAll('.atk-cb:checked').forEach(cb => {
+    const cityId = cb.dataset.city;
+    const pre = parseFloat(document.querySelector(`.atk-pre[data-city="${cityId}"]`).value) || 0;
+    const post = parseFloat(document.querySelector(`.atk-post[data-city="${cityId}"]`).value) || 0;
+    const pr = parseInt(document.querySelector(`.atk-priority[data-city="${cityId}"]`).value) || 1;
+    if(pre > 0) atk.push({ cityId, preWarPercent: pre, postRevivePercent: post, priority: pr });
+  });
+  document.querySelectorAll('.def-cb:checked').forEach(cb => {
+    const cityId = cb.dataset.city;
+    const pre = parseFloat(document.querySelector(`.def-pre[data-city="${cityId}"]`).value) || 0;
+    const post = parseFloat(document.querySelector(`.def-post[data-city="${cityId}"]`).value) || 0;
+    const pr = parseInt(document.querySelector(`.def-priority[data-city="${cityId}"]`).value) || 1;
+    if(pre > 0) def.push({ cityId, preWarPercent: pre, postRevivePercent: post, priority: pr });
+  });
+  return {attackTargets:atk, defendTargets:def};
+}
+function applyAISuggestion(){
+  const currentCity = {
+    avgPower: parseFloat(document.getElementById('cm_avgPower').value) || 1,
+    totalTeams: parseFloat(document.getElementById('cm_totalTeams').value) || 0,
+    attackTargets: [],
+    defendTargets: [],
+  };
+  if (!currentCity.totalTeams){ alert('請先輸入總隊數'); return; }
+  const currentAtk = [], currentDef = [];
+  document.querySelectorAll('.atk-cb:checked').forEach(cb => {
+    const cityId = cb.dataset.city;
+    const pre = parseFloat(document.querySelector(`.atk-pre[data-city="${cityId}"]`).value) || 0;
+    const pr = parseInt(document.querySelector(`.atk-priority[data-city="${cityId}"]`).value) || 1;
+    if (pre > 0) currentAtk.push({ cityId, priority: pr });
+  });
+  document.querySelectorAll('.def-cb:checked').forEach(cb => {
+    const cityId = cb.dataset.city;
+    const pre = parseFloat(document.querySelector(`.def-pre[data-city="${cityId}"]`).value) || 0;
+    const pr = parseInt(document.querySelector(`.def-priority[data-city="${cityId}"]`).value) || 1;
+    if (pre > 0) currentDef.push({ cityId, priority: pr });
+  });
+  if (currentAtk.length === 0 && currentDef.length === 0){
+    alert('請先勾選至少一個進攻或協防目標'); return;
+  }
+  currentCity.attackTargets = currentAtk;
+  currentCity.defendTargets = currentDef;
+  const suggestion = AI.suggestForCity(currentCity, state.cities);
+  for (const s of suggestion.atk){
+    const preEl = document.querySelector(`.atk-pre[data-city="${s.cityId}"]`);
+    const postEl = document.querySelector(`.atk-post[data-city="${s.cityId}"]`);
+    if (preEl) preEl.value = s.preWarPercent;
+    if (postEl) postEl.value = s.postRevivePercent;
+  }
+  for (const s of suggestion.def){
+    const preEl = document.querySelector(`.def-pre[data-city="${s.cityId}"]`);
+    const postEl = document.querySelector(`.def-post[data-city="${s.cityId}"]`);
+    if (preEl) preEl.value = s.preWarPercent;
+    if (postEl) postEl.value = s.postRevivePercent;
+  }
+  updateAllocPanel();
+  logSystem('🤖 AI 佈兵建議已套用');
+}
+function openCityModal(cityId){
+  editingCityId = cityId || null;
+  const isNew = !editingCityId;
+  const city = isNew ? null : state.cities.find(c => c.id === editingCityId);
+  if(!isNew && isConnected()) acquireEditLock(editingCityId);
+  document.getElementById('cityModalTitle').textContent = isNew ? '🏰 新增城池' : `✏️ 編輯城池：${city ? city.name : ''}`;
+  const zoneSel = document.getElementById('cm_zone');
+  zoneSel.innerHTML = state.zones.map(z => `<option value="${z.id}">${esc(z.name)}</option>`).join('') || '<option value="">（尚未建立戰區）</option>';
+  const allianceSel = document.getElementById('cm_alliance');
+  allianceSel.innerHTML = '<option value="">（不指定）</option>' + state.alliances.map(a => `<option value="${a.id}">${a.icon ? a.icon + ' ' : ''}${esc(a.name)}（${allianceSideLabel(a.side)}）</option>`).join('');
+  if(isNew){
+    document.getElementById('cm_name').value = '';
+    document.getElementById('cm_side').value = 'self';
+    document.getElementById('cm_totalPower').value = 100000;
+    document.getElementById('cm_totalTeams').value = 100;
+    document.getElementById('cm_cooldownMin').value = 5;
+    document.getElementById('cm_wallMin').value = 30;
+    document.getElementById('cm_defStartTime').value = '19:00';
+    document.getElementById('cm_isCapital').checked = false;
+    if(state.zones.length > 0) zoneSel.value = state.zones[0].id;
+  } else {
+    document.getElementById('cm_name').value = city.name;
+    document.getElementById('cm_zone').value = city.zoneId || '';
+    document.getElementById('cm_alliance').value = city.allianceId || '';
+    document.getElementById('cm_side').value = city.side;
+    document.getElementById('cm_totalPower').value = city.totalPower;
+    document.getElementById('cm_totalTeams').value = city.totalTeams;
+    document.getElementById('cm_cooldownMin').value = city.cooldownMin;
+    document.getElementById('cm_wallMin').value = city.wallMin;
+    document.getElementById('cm_defStartTime').value = city.defStartTime || '19:00';
+    document.getElementById('cm_isCapital').checked = !!city.isCapital;
+  }
+  updateAutoCalcFields(); updateSectionLabels();
+  renderTargetSelectors(city ? (city.attackTargets || []) : [], city ? (city.defendTargets || []) : []);
+  document.getElementById('cityModal').classList.add('show');
+}
+function closeCityModal(){
+  if(editingCityId && isConnected()) releaseEditLock(editingCityId);
+  delete state.editLocks[editingCityId];
+  document.getElementById('cityModal').classList.remove('show');
+  editingCityId = null;
+  R.renderCities();
+  if (document.getElementById('tab-deploy').classList.contains('active')) DEPLOY.render();
+}
+function saveCityFromModal(){
+  const name = document.getElementById('cm_name').value.trim();
+  if(!name){ alert('請輸入城池名稱'); return; }
+  const zoneId = document.getElementById('cm_zone').value;
+  if(!zoneId){ alert('請先建立並選擇戰區'); return; }
+  const allianceId = document.getElementById('cm_alliance').value;
+  const side = document.getElementById('cm_side').value;
+  const totalPower = parseFloat(document.getElementById('cm_totalPower').value) || 0;
+  const totalTeams = parseFloat(document.getElementById('cm_totalTeams').value) || 0;
+  const cooldownMin = parseFloat(document.getElementById('cm_cooldownMin').value) || 0;
+  const wallMin = parseFloat(document.getElementById('cm_wallMin').value) || 0;
+  const defStartTime = document.getElementById('cm_defStartTime').value || '19:00';
+  const isCapital = document.getElementById('cm_isCapital').checked;
+  const {attackTargets, defendTargets} = collectCurrentTargets();
+  const avgPower = totalTeams > 0 ? Math.floor(totalPower / totalTeams) : 0;
+  const id = editingCityId || uid();
+  if(isCapital && allianceId){
+    state.cities.forEach(c => { if(c.allianceId === allianceId && c.isCapital && c.id !== id){ c.isCapital = false; state.entityRev.city[c.id] = (state.entityRev.city[c.id] || 0) + 1; markDirty('city', c.id); } });
+  }
+  const entity = { id, name, zoneId, allianceId, side, totalPower, totalTeams, avgPower, cooldownMin, wallMin, defStartTime, isCapital, attackTargets, defendTargets };
+  upsertEntity('city', entity);
+  closeCityModal();
+  R.renderCities();
+  saveState();
+}
+
+/* ============ 模擬調度 ============ */
+function collectCitiesForSim(zoneId){ return zoneId === 'all' ? state.cities : state.cities.filter(c => c.zoneId === zoneId); }
+function executeSimulation(zoneId){
+  if(state.isSimulating) return;
+  const timeLimitMin = parseInt(document.getElementById('globalTimeLimit').value) || 120;
+  const consumeMinPerMin = parseFloat(document.getElementById('globalConsumeMinPerMin').value) || 10;
+  const consumeMaxPerMin = parseFloat(document.getElementById('globalConsumeMaxPerMin').value) || 30;
+  const siegeEfficiency = parseFloat(document.getElementById('globalSiegeEfficiency').value) || 1;
+  const marchTimeSec = parseInt(document.getElementById('globalMarchTimeSec').value) || 0;
+  const maxLossRatio = (parseFloat(document.getElementById('globalMaxLossRatio').value) || 90) / 100;
+  const minLossRatio = (parseFloat(document.getElementById('globalMinLossRatio').value) || 10) / 100;
+  Object.assign(state.settings, { timeLimitMin, consumeMinPerMin, consumeMaxPerMin, siegeEfficiency, marchTimeSec, maxLossRatio, minLossRatio });
+  state.settingsRev++;
+  saveState();
+
+  const cities = collectCitiesForSim(zoneId);
+  if(cities.length === 0){ logSystem('❌ 無城池資料'); return; }
+  const v = validateCrossDay(cities, timeLimitMin);
+  if(!v.ok){ logSystem('❌ ' + v.msg); return; }
+  const defStartMins = cities.map(c => hhmmToMinutes(c.defStartTime || '19:00'));
+  state.simBaseMin = Math.min(...defStartMins);
+  state.isSimulating = true;
+  state.dynRows = []; state.narrativeLines = [];
+  document.getElementById('narrativeOutput').innerHTML = '推演中...';
+  DYN.setRows([]); viz.reset(); R.renderProgress(0);
+  const runId = ++simRunId;
+  const maxDefStartRel = Math.max(...defStartMins) - state.simBaseMin;
+  const maxSec = maxDefStartRel * 60 + timeLimitMin * 60;
+  const snapshotSet = viz.getSchedule(maxSec);
+  const dynSet = new Set();
+  for(let s=0;s<=maxSec;s+=DYN_ROUTE_SAMPLE_SEC) dynSet.add(s);
+  dynSet.add(maxSec);
+  const dynRowsBuffer = [];
+  const worker = getWorker();
+  if(worker){
+    const onMessage = (e) => {
+      const msg = e.data || {};
+      if(msg.runId !== runId) return;
+      switch(msg.type){
+        case 'progress': R.renderDebug({msg:`⏳ ${Math.round(msg.progress*100)}%`}); R.renderProgress(msg.progress); break;
+        case 'snapshot': viz.ingestSnapshot(msg.sec, msg.snap); break;
+        case 'dyn_sample': if(msg.rows) for(const r of msg.rows) dynRowsBuffer.push(r); break;
+        case 'done': worker.removeEventListener('message', onMessage); state.dynRows = dynRowsBuffer; handleSimulationDone(msg.result); break;
+        case 'error': worker.removeEventListener('message', onMessage); logSystem('❌ 推演失敗：' + msg.error); state.isSimulating = false; break;
+      }
+    };
+    worker.addEventListener('message', onMessage);
+    worker.postMessage({ type:'run', payload:{ cities: JSON.parse(JSON.stringify(cities)), settings: {...state.settings}, snapshotsAt: snapshotSet, dynSampleAt: [...dynSet], runId } });
+    return;
+  }
+  setTimeout(async () => {
+    try{
+      const result = await runSimulation(JSON.parse(JSON.stringify(cities)), {...state.settings}, {
+        onProgress: ({progress}) => { R.renderProgress(progress); R.renderDebug({msg:`⏳ ${Math.round(progress*100)}%`}); },
+        onSnapshot: (sec, snap) => viz.ingestSnapshot(sec, snap),
+        snapshotAt: new Set(snapshotSet),
+        dynSampleAt: new Set(dynSet),
+        onDynSample: (sec, rows) => { for(const r of rows) dynRowsBuffer.push(r); },
+      });
+      state.dynRows = dynRowsBuffer;
+      handleSimulationDone(result);
+    }catch(err){ console.error(err); state.isSimulating = false; }
+  }, 30);
+}
+function handleSimulationDone(result){
+  R.renderProgress(1);
+  setTimeout(() => R.renderProgress(0), 1000);
+  if(result.aborted){ logSystem('⛔ 推演已中止'); state.isSimulating = false; return; }
+  if(result.minDefStartMin !== undefined) state.simBaseMin = result.minDefStartMin;
+  state.narrativeLines = result.narrativeLines || [];
+  R.renderNarrative(state.narrativeLines);
+  DYN.setRows(state.dynRows);
+  DYN.populateCityFilters();
+  saveState();
+  if(state.isHost && isConnected()){
+    publish({ type:'viz_payload', data: viz.getAllSnapshots() });
+    publish({ type:'dyn_payload', rows: state.dynRows });
+  }
+  viz.finalize();
+  state.isSimulating = false;
+  logSystem('✅ 推演完成');
+}
+
 /* ============ 事件綁定 ============ */
 function bindUI(){
   document.querySelectorAll('.top-nav button').forEach(btn => {
@@ -2835,7 +3057,7 @@ function bindUI(){
     state.commanderName = name;
     const code = String(Math.floor(100000 + Math.random()*900000));
     document.getElementById('roomCode').value = code;
-    connectMQTT(code, true); saveState();
+    connectFirebase(code, true); saveState();
   });
   document.getElementById('btnJoinRoom').addEventListener('click', () => {
     const name = nameInput.value.trim();
@@ -2843,9 +3065,9 @@ function bindUI(){
     const code = document.getElementById('roomCode').value.trim();
     if(code.length !== 6){ alert('請輸入6位數房間碼'); return; }
     state.commanderName = name;
-    connectMQTT(code, false); saveState();
+    connectFirebase(code, false); saveState();
   });
-  document.getElementById('btnDisconnect').addEventListener('click', () => showConfirm('中斷連線', '確定要中斷與盟友的連線嗎？', () => disconnectMQTT()));
+  document.getElementById('btnDisconnect').addEventListener('click', () => showConfirm('中斷連線', '確定要中斷與盟友的連線嗎？', () => disconnectFirebase()));
   document.getElementById('btnSaveSettings').addEventListener('click', () => {
     updateSettings({
       timeLimitMin: parseInt(document.getElementById('globalTimeLimit').value) || 120,
@@ -2949,13 +3171,27 @@ function bindUI(){
   });
   document.getElementById('modalCancel').addEventListener('click', () => { document.getElementById('confirmModal').classList.remove('show'); confirmCb = null; });
   document.getElementById('modalConfirm').addEventListener('click', () => { document.getElementById('confirmModal').classList.remove('show'); if(confirmCb) confirmCb(); confirmCb = null; });
+  // 檔案/連結
+  document.getElementById('btnExportJSON').addEventListener('click', exportSandboxJSON);
+  document.getElementById('btnImportJSON').addEventListener('click', () => document.getElementById('importFileInput').click());
+  document.getElementById('importFileInput').addEventListener('change', function(){
+    if (this.files && this.files[0]) importSandboxJSON(this.files[0]);
+    this.value = '';
+  });
+  document.getElementById('btnGenerateShareLink').addEventListener('click', generateShareLink);
+  document.getElementById('btnCopyShareLink').addEventListener('click', copyShareLink);
+  document.getElementById('importModeOverwrite').addEventListener('click', () => applyImport('overwrite'));
+  document.getElementById('importModeMerge').addEventListener('click', () => applyImport('merge'));
+  document.getElementById('importModeCancel').addEventListener('click', () => {
+    document.getElementById('importModal').classList.remove('show');
+    pendingImportData = null;
+  });
   window.addEventListener('beforeunload', saveState);
   DEPLOY.init();
 }
 function bindEvents(){
   on(EVT.DEBUG, R.renderDebug);
   on(EVT.CONN, () => { R.renderHealth(); R.renderHost(); });
-  on(EVT.PING, R.renderPing);
   on(EVT.MEMBERS, R.renderMembers);
   on(EVT.HOST, R.renderHost);
   on(EVT.LOCKS, () => { R.renderCities(); if (document.getElementById('tab-deploy').classList.contains('active')) DEPLOY.render(); });
@@ -2988,14 +3224,27 @@ function boot(){
   document.getElementById('globalMaxLossRatio').value = Math.round(state.settings.maxLossRatio * 100);
   document.getElementById('globalMinLossRatio').value = Math.round(state.settings.minLossRatio * 100);
   syncAIParamsToUI();
-  registerSender(patches => { if(!state.connected) return; publish({ type:'sync_patch', clientId:state.myClientId, lamport:state.lamport, patches }); });
+  registerSender(patches => {
+    if(!state.connected) return;
+    publish({ type:'sync_patch', clientId:state.myClientId, lamport:state.lamport, patches });
+  });
   bindUI(); bindEvents();
   viz.init(); DYN.init(); resetAllianceForm(); R.renderAll();
   DYN.setRows(state.dynRows); DYN.populateCityFilters();
   R.renderNarrative(state.narrativeLines);
   R.renderProgress(0);
   DEPLOY.populateZoneFilter();
-  console.log('%c[沙盤 v7.3] 盟徽 + 三佈局連線圖 + 全部功能就緒', 'color:#22ff88;font-weight:bold;font-size:14px');
+
+  // 分享連結載入（優先）
+  setTimeout(() => {
+    if (loadFromShareLink()){
+      R.renderAll();
+      DYN.populateCityFilters();
+      DEPLOY.populateZoneFilter();
+    }
+  }, 50);
+
+  console.log('%c[沙盤 v7.4] Firebase + 盟徽 + 三佈局連線圖（就緒）', 'color:#22ff88;font-weight:bold;font-size:14px');
 }
 if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
