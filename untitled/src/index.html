@@ -3,11 +3,11 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>多戰區城戰沙盤推演與多人聯合作戰室 v7.5</title>
+<title>多戰區城戰沙盤推演與多人聯合作戰室 v7.6</title>
 <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-database-compat.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.4.4/lz-string.min.js"></script>
-<link rel="stylesheet" href="style.css?v=75">
+<link rel="stylesheet" href="style.css?v=76">
 </head>
 <body>
 
@@ -42,6 +42,7 @@
       ＊「匯出」會下載一個 .json 檔案，包含所有同盟、戰區、城池資料。<br>
       ＊「匯入」可選擇「覆蓋」或「合併」，合併時以匯入的資料為優先。
     </div>
+    <button class="btn btn-warning btn-sm mt-8" id="btnRestoreBackup">♻️ 恢復本機備份</button>
   </div>
 
   <div class="card">
@@ -75,6 +76,10 @@
       <button class="btn btn-primary btn-sm" id="btnCreateRoom">🏠 創建房間</button>
       <button class="btn btn-success btn-sm" id="btnJoinRoom">🔗 加入盟友房間</button>
       <button class="btn btn-danger btn-sm" id="btnDisconnect">🔌 中斷連線</button>
+    </div>
+    <!-- 申請推送按鈕（僅非房主可見） -->
+    <div class="flex-row mt-8" id="pushRequestRow" style="display:none;">
+      <button class="btn btn-warning btn-block" id="btnRequestPush">📤 申請推送本機資料到房間</button>
     </div>
     <div class="flex-row mt-8" style="justify-content:space-between;">
       <span class="health-indicator"><span class="health-dot red" id="healthDot"></span><span id="healthText">未連線</span></span>
@@ -390,7 +395,7 @@
 <!-- ============ 戰鬥規則 ============ -->
 <section id="tab-rules" class="tab-content">
   <div class="card">
-    <div class="card-title">📖 城戰計算規則（v7.5）</div>
+    <div class="card-title">📖 城戰計算規則（v7.6）</div>
     <div class="rules-doc">
       <h2>一、對戰節奏</h2>
       <div class="rule-card ok">
@@ -418,6 +423,7 @@
       <h2>五、協作模式</h2>
       <ul>
         <li><b>Firebase 即時連線</b>：透過 Google Firebase 即時同步。</li>
+        <li><b>成員推送申請</b>：成員可申請把本機資料覆蓋房間，房主審核。</li>
         <li><b>檔案協作</b>：匯出 JSON 檔案傳給朋友，合併編輯。</li>
         <li><b>分享連結</b>：將沙盤壓縮成網址，貼給朋友載入。</li>
         <li><b>作戰聊天室</b>：即時聊天，附未讀計數。</li>
@@ -436,6 +442,46 @@
     <div class="modal-actions">
       <button class="btn btn-ghost" id="modalCancel">取消</button>
       <button class="btn btn-danger" id="modalConfirm">確認執行</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 推送申請對話框（房主審核） ============ -->
+<div class="modal-overlay" id="pushRequestModal">
+  <div class="modal-box">
+    <h3>📤 收到推送申請</h3>
+    <div id="pushRequestInfo" style="white-space:pre-line;font-size:12px;color:var(--text-secondary);margin-bottom:14px;line-height:1.7;"></div>
+    <div class="text-warn" style="margin-bottom:14px;">⚠️ 接受後，房間內現有資料將被完全覆蓋，請確認後再操作。</div>
+    <div class="modal-actions">
+      <button class="btn btn-danger" id="pushRequestReject">拒絕</button>
+      <button class="btn btn-success" id="pushRequestApprove">接受並覆蓋</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 退出房間對話框 ============ -->
+<div class="modal-overlay" id="exitRoomModal">
+  <div class="modal-box" style="max-width:420px;">
+    <h3>🚪 離開房間</h3>
+    <p style="margin-bottom:12px;">您即將離開房間。請選擇要保留哪一份資料到本機：</p>
+    <div class="exit-options">
+      <button class="exit-option" data-exit-choice="keep">
+        <div class="exit-icon">🔒</div>
+        <div class="exit-body">
+          <div class="exit-title">保留房間資料</div>
+          <div class="exit-desc">把目前房間內的資料存到本機</div>
+        </div>
+      </button>
+      <button class="exit-option" data-exit-choice="restore">
+        <div class="exit-icon">↩️</div>
+        <div class="exit-body">
+          <div class="exit-title">恢復進入前的資料</div>
+          <div class="exit-desc" id="exitRestoreDesc">還原成加入房間前的本機資料</div>
+        </div>
+      </button>
+    </div>
+    <div class="modal-actions" style="justify-content:center;margin-top:8px;">
+      <button class="btn btn-ghost btn-block" id="exitRoomCancel">取消，繼續留在房間</button>
     </div>
   </div>
 </div>
@@ -511,6 +557,6 @@
   </div>
 </div>
 
-<script src="script.js?v=75"></script>
+<script src="script.js?v=76"></script>
 </body>
 </html>

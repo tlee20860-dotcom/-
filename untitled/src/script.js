@@ -1,5 +1,5 @@
 /* ============================================================================
- * v7.5：Firebase 即時連線 + 盟徽 + 聊天室 + 佈兵總覽
+ * v7.6：Firebase 即時連線 + 盟徽 + 聊天室 + 佈兵總覽 + 推送申請
  * ========================================================================== */
 (function(){
 'use strict';
@@ -30,6 +30,8 @@ const EVT = {
   CONN:'conn', HOST:'host', CHAT_NEW:'chat:new',
   SIM_TRIGGER:'sim:trigger', DEBUG:'debug', VIZ_SNAPSHOTS:'viz:snapshots', VIZ_RESET:'viz:reset',
   DYN_RESULT:'dyn:result',
+  PUSH_REQUEST:'push:request',
+  PUSH_RESPONSE:'push:response',
 };
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
@@ -164,6 +166,8 @@ const state = {
   narrativeLines: [],
   chatMessages: [],
   unreadChat: 0,
+  pushRequestStatus: 'idle',
+  pendingPushRequest: null,
 };
 
 const bus = new Map();
@@ -183,6 +187,7 @@ function saveState(){
       dynRows: state.dynRows.slice(-5000),
       narrativeLines: state.narrativeLines.slice(-1000),
       chatMessages: state.chatMessages.slice(-200),
+      pushRequestStatus: state.pushRequestStatus,
     }));
   }catch(e){ console.warn('儲存失敗', e); }
 }
@@ -232,6 +237,9 @@ function loadState(){
     if(Array.isArray(d.dynRows)) state.dynRows = d.dynRows.slice(-5000);
     if(Array.isArray(d.narrativeLines)) state.narrativeLines = d.narrativeLines.slice(-1000);
     if(Array.isArray(d.chatMessages)) state.chatMessages = d.chatMessages.slice(-200);
+    if(d.pushRequestStatus && ['idle','pending','rejected'].includes(d.pushRequestStatus)){
+      state.pushRequestStatus = d.pushRequestStatus;
+    }
   }catch(e){ console.warn('讀取失敗', e); }
 }
 
@@ -309,29 +317,28 @@ function buildFullSnapshot(){
 }
 function applyFullSnapshot(snap){
   if(!snap) return false;
-  if(snap.epoch && state.roomEpoch && snap.epoch !== state.roomEpoch) state.roomEpoch = snap.epoch;
-  if(isNewer(snap.settingsRev, state.settingsRev)){ Object.assign(state.settings, snap.settings); state.settingsRev = snap.settingsRev; }
-  const mergeColl = (kind, incoming) => {
-    const coll = kind==='alliance' ? state.alliances : kind==='zone' ? state.zones : state.cities;
-    const map = new Map(coll.map(x => [x.id, x]));
-    for(const ent of incoming){
-      const localRev = state.entityRev[kind][ent.id] || 0;
-      const remoteRev = snap.entityRev?.[kind]?.[ent.id] || 0;
-      if(isNewer(remoteRev, localRev)){ map.set(ent.id, ent); state.entityRev[kind][ent.id] = remoteRev; }
+
+  if(snap.epoch) state.roomEpoch = snap.epoch;
+
+  if(snap.settings){
+    Object.assign(state.settings, snap.settings);
+    state.settingsRev = snap.settingsRev || 0;
+  }
+  state.alliances = JSON.parse(JSON.stringify(snap.alliances || []));
+  state.zones     = JSON.parse(JSON.stringify(snap.zones     || []));
+  state.cities    = JSON.parse(JSON.stringify(snap.cities    || []));
+
+  state.entityRev = { alliance:{}, zone:{}, city:{} };
+  for(const [kind, arr] of [
+    ['alliance', state.alliances],
+    ['zone', state.zones],
+    ['city', state.cities]
+  ]){
+    for(const ent of arr){
+      state.entityRev[kind][ent.id] = snap.entityRev?.[kind]?.[ent.id] || 0;
     }
-    const incomingIds = new Set(incoming.map(x => x.id));
-    for(const [id] of [...map]){
-      if(!incomingIds.has(id)){
-        const remoteRev = snap.entityRev?.[kind]?.[id] || 0;
-        const localRev = state.entityRev[kind][id] || 0;
-        if(isNewer(remoteRev, localRev)) map.delete(id);
-      }
-    }
-    coll.length = 0; for(const ent of map.values()) coll.push(ent);
-  };
-  mergeColl('alliance', snap.alliances || []);
-  mergeColl('zone', snap.zones || []);
-  mergeColl('city', snap.cities || []);
+  }
+
   tickLamport(snap.lamport || 0);
   return true;
 }
@@ -379,15 +386,10 @@ function connectFirebase(roomCode, asHost){
   emit(EVT.CONN);
   emit(EVT.DEBUG, {msg:'🟡 正在連線至 Firebase...'});
 
-  try{
-    if(!fbApp){
-      fbApp = firebase.initializeApp(FIREBASE_CONFIG);
-      fbDb = firebase.database();
-    }
-  }catch(e){
+  if(!fbDb){
     state.connecting = false;
     emit(EVT.CONN);
-    emit(EVT.DEBUG, {msg:'❌ Firebase 初始化失敗：' + e.message, err:true});
+    emit(EVT.DEBUG, {msg:'❌ Firebase 未初始化', err:true});
     return;
   }
 
@@ -472,7 +474,6 @@ function onFirebaseConnected(asHost){
     emit(EVT.LOCKS);
   });
 
-  // 聊天室
   chatRef = fbDb.ref(`rooms/${state.roomCode}/chat`);
   const chatHandler = chatRef.limitToLast(200).on('child_added', snap => {
     const m = snap.val();
@@ -500,21 +501,46 @@ function onFirebaseConnected(asHost){
   saveState();
   emit(EVT.HOST);
 
-  if(state.isHost){
-    state.roomEpoch = uid();
-    setTimeout(() => {
-      if(state.alliances.length || state.zones.length || state.cities.length){
-        publish(buildFullSnapshot());
-        emit(EVT.DEBUG, {msg:'📤 已推送現有沙盤快照'});
-      }
-    }, 400);
-  } else {
-    setTimeout(() => {
-      publish({ type:'sync_request', clientId:state.myClientId, name:state.commanderName });
-    }, 400);
-  }
+  const decideSyncMode = () => {
+    if(state.isHost){
+      state.roomEpoch = uid();
+
+      fbDb.ref(`rooms/${state.roomCode}/events`).limitToLast(1).once('value')
+        .then(snap => {
+          const hasEvents = snap.exists() && snap.numChildren() > 0;
+
+          if(!hasEvents){
+            if(state.alliances.length || state.zones.length || state.cities.length){
+              setTimeout(() => {
+                publish(buildFullSnapshot());
+                emit(EVT.DEBUG, {msg:'📤 新房間，已推送本機沙盤'});
+              }, 400);
+            } else {
+              emit(EVT.DEBUG, {msg:'📭 新房間，本機無資料'});
+            }
+          } else {
+            emit(EVT.DEBUG, {msg:'⚠️ 房間已有資料，改為拉取模式'});
+            backupLocalBeforeJoin();
+            setTimeout(() => {
+              publish({ type:'sync_request', clientId:state.myClientId, name:state.commanderName });
+            }, 400);
+          }
+        })
+        .catch(() => {
+          emit(EVT.DEBUG, {msg:'⚠️ 無法探測房間狀態，略過推送', err:true});
+        });
+
+    } else {
+      backupLocalBeforeJoin();
+      setTimeout(() => {
+        publish({ type:'sync_request', clientId:state.myClientId, name:state.commanderName });
+      }, 400);
+    }
+  };
+  decideSyncMode();
 
   startEditLockRenew();
+  updatePushButtonState();
 }
 
 function checkHostHealthFirebase(){
@@ -537,6 +563,7 @@ function checkHostHealthFirebase(){
       emit(EVT.HOST);
       logSystem('👑 你已成為房主');
       saveState();
+      updatePushButtonState();
     }
   }
 }
@@ -575,24 +602,23 @@ function disconnectFirebase(){
   state.members = {};
   state.editLocks = {};
   state.roomCode = '';
+
+  state.pushRequestStatus = 'idle';
+  state.pendingPushRequest = null;
+  const pushModal = document.getElementById('pushRequestModal');
+  if(pushModal) pushModal.classList.remove('show');
+  const exitModal = document.getElementById('exitRoomModal');
+  if(exitModal) exitModal.classList.remove('show');
+
   emit(EVT.CONN); emit(EVT.MEMBERS); emit(EVT.HOST); emit(EVT.LOCKS);
   emit(EVT.DEBUG, {msg:'🔴 已中斷連線'});
   saveState();
+  updatePushButtonState();
 }
 
 function publish(payload){
   if(!fbConnected || !fbDb || !state.roomCode) return;
   try{
-    if(payload.type === 'chat'){
-      fbDb.ref(`rooms/${state.roomCode}/chat`).push({
-        sender: payload.sender,
-        text: payload.text,
-        time: nowTime(),
-        _from: state.myClientId,
-        _ts: Date.now(),
-      });
-      return;
-    }
     fbDb.ref(`rooms/${state.roomCode}/events`).push({
       ...payload,
       _from: state.myClientId,
@@ -644,7 +670,11 @@ function handleIncoming(payload){
       break;
     }
     case 'sync_snapshot': {
-      if(applyFullSnapshot(payload)){ emit(EVT.DATA); saveState(); emit(EVT.DEBUG, {msg:'🔄 已同步房主快照'}); }
+      if(applyFullSnapshot(payload)){
+        emit(EVT.DATA);
+        saveState();
+        emit(EVT.DEBUG, {msg:'🔄 已同步房主快照（本機資料被覆蓋）'});
+      }
       break;
     }
     case 'sync_request': {
@@ -667,6 +697,16 @@ function handleIncoming(payload){
     }
     case 'dyn_payload': {
       if(payload.rows){ state.dynRows = payload.rows; emit(EVT.DYN_RESULT); }
+      break;
+    }
+    case 'push_request': {
+      if(!state.isHost) return;
+      handlePushRequestFromMember(payload);
+      break;
+    }
+    case 'push_response': {
+      if(payload.targetClientId !== state.myClientId) return;
+      handlePushResponse(payload);
       break;
     }
   }
@@ -730,11 +770,202 @@ function sendSystemChat(text){
     });
   }catch(e){}
 }
-/* ============================================================
-   模擬引擎 v7.5
-   ============================================================ */
+
+/* ============ 推送申請機制 ============ */
+function requestPushToRoom(){
+  if(!isConnected()){ alert('請先加入房間'); return; }
+  if(state.isHost){ alert('房主不需申請推送'); return; }
+  if(state.pushRequestStatus === 'pending'){ alert('已有申請等待房主回應'); return; }
+
+  const hasData = state.alliances.length || state.zones.length || state.cities.length;
+  if(!hasData){ alert('本機沒有任何資料可推送'); return; }
+
+  state.pushRequestStatus = 'pending';
+  updatePushButtonState();
+  saveState();
+
+  publish({
+    type: 'push_request',
+    clientId: state.myClientId,
+    name: state.commanderName,
+    stats: {
+      cities: state.cities.length,
+      alliances: state.alliances.length,
+      zones: state.zones.length,
+    },
+  });
+  logSystem('📤 已向房主發送推送申請...');
+}
+
+function handlePushRequestFromMember(payload){
+  if(state.pendingPushRequest){
+    logSystem(`⏸️ ${payload.name} 的推送申請被忽略（已有進行中的申請）`);
+    return;
+  }
+
+  state.pendingPushRequest = payload;
+
+  const info = `${payload.name} 想要推送本機資料到房間：\n\n` +
+    `🏰 城池：${payload.stats.cities} 座\n` +
+    `🤝 同盟：${payload.stats.alliances} 個\n` +
+    `🗺️ 戰區：${payload.stats.zones} 個`;
+
+  document.getElementById('pushRequestInfo').textContent = info;
+  document.getElementById('pushRequestModal').classList.add('show');
+  logSystem(`📥 收到 ${payload.name} 的推送申請`);
+}
+
+function approvePush(){
+  const req = state.pendingPushRequest;
+  if(!req) return;
+
+  publish({
+    type: 'push_response',
+    targetClientId: req.clientId,
+    approved: true,
+    hostName: state.commanderName,
+  });
+
+  logSystem(`✅ 已同意 ${req.name} 的推送申請`);
+  sendSystemChat(`✅ 房主同意了 ${req.name} 的推送申請`);
+
+  state.pendingPushRequest = null;
+  document.getElementById('pushRequestModal').classList.remove('show');
+}
+
+function rejectPush(){
+  const req = state.pendingPushRequest;
+  if(!req) return;
+
+  publish({
+    type: 'push_response',
+    targetClientId: req.clientId,
+    approved: false,
+    hostName: state.commanderName,
+  });
+
+  logSystem(`❌ 已拒絕 ${req.name} 的推送申請`);
+
+  state.pendingPushRequest = null;
+  document.getElementById('pushRequestModal').classList.remove('show');
+}
+
+function handlePushResponse(payload){
+  if(payload.approved){
+    logSystem(`✅ 房主 ${payload.hostName || ''} 同意推送，開始上傳...`);
+    state.pushRequestStatus = 'idle';
+    updatePushButtonState();
+    saveState();
+
+    try{
+      publish(buildFullSnapshot());
+      sendSystemChat(`📤 ${state.commanderName} 已覆蓋房間資料`);
+      alert('✅ 房主已接受，您的資料已推送到房間。');
+    }catch(e){
+      console.error('推送失敗', e);
+      alert('❌ 推送失敗：' + e.message);
+    }
+  } else {
+    logSystem(`❌ 房主拒絕了推送申請`);
+    state.pushRequestStatus = 'idle';
+    updatePushButtonState();
+    saveState();
+    alert('❌ 房主拒絕了您的推送申請，房間資料未變更。');
+  }
+}
+
+function updatePushButtonState(){
+  const row = document.getElementById('pushRequestRow');
+  const btn = document.getElementById('btnRequestPush');
+  if(!row || !btn) return;
+
+  if(!isConnected() || state.isHost){
+    row.style.display = 'none';
+    return;
+  }
+  row.style.display = '';
+
+  const hasData = state.alliances.length || state.zones.length || state.cities.length;
+  if(state.pushRequestStatus === 'pending'){
+    btn.disabled = true;
+    btn.textContent = '⏳ 等待房主回應...';
+    btn.classList.remove('btn-warning');
+    btn.classList.add('btn-ghost');
+  } else if(!hasData){
+    btn.disabled = true;
+    btn.textContent = '📭 本機無資料可推送';
+    btn.classList.remove('btn-warning');
+    btn.classList.add('btn-ghost');
+  } else {
+    btn.disabled = false;
+    btn.textContent = '📤 申請推送本機資料到房間';
+    btn.classList.add('btn-warning');
+    btn.classList.remove('btn-ghost');
+  }
+}
+
+/* ============ 退出房間機制 ============ */
+function requestDisconnect(){
+  if(!isConnected()){
+    disconnectFirebase();
+    return;
+  }
+
+  const hasBackup = !!localStorage.getItem(LS_PREFIX + 'localBackup');
+  const hasRoomData = state.alliances.length || state.zones.length || state.cities.length;
+
+  if(!hasBackup || !hasRoomData){
+    const msg = hasRoomData
+      ? '確定要中斷與盟友的連線嗎？（目前房間資料會保留在本機）'
+      : '確定要中斷與盟友的連線嗎？';
+    showConfirm('中斷連線', msg, () => disconnectFirebase());
+    return;
+  }
+
+  let backupInfo = '';
+  try{
+    const b = JSON.parse(localStorage.getItem(LS_PREFIX + 'localBackup'));
+    backupInfo = `（${(b.cities||[]).length} 座城 · ${b.backedUpAt ? new Date(b.backedUpAt).toLocaleString() : '未知時間'}）`;
+  }catch(e){}
+
+  const desc = document.getElementById('exitRestoreDesc');
+  if(desc) desc.textContent = '還原成加入房間前的本機資料 ' + backupInfo;
+
+  document.getElementById('exitRoomModal').classList.add('show');
+}
+
+function confirmExit(choice){
+  document.getElementById('exitRoomModal').classList.remove('show');
+
+  if(choice === 'restore'){
+    const raw = localStorage.getItem(LS_PREFIX + 'localBackup');
+    if(raw){
+      try{
+        const backup = JSON.parse(raw);
+        state.alliances = backup.alliances || [];
+        state.zones     = backup.zones     || [];
+        state.cities    = backup.cities    || [];
+        if(backup.settings) Object.assign(state.settings, backup.settings);
+        logSystem('↩️ 已恢復進入房間前的本機資料');
+      }catch(e){
+        console.warn('恢復備份失敗', e);
+      }
+    }
+  } else {
+    localStorage.removeItem(LS_PREFIX + 'localBackup');
+    logSystem('🔒 已保留房間資料到本機（本機備份已清除）');
+  }
+
+  disconnectFirebase();
+
+  R.renderAll();
+  DYN.populateCityFilters();
+  DEPLOY.populateZoneFilter();
+}
+
+/* ============ 模擬引擎 ============ */
 async function runSimulation(cities, settings, opts = {}){
-  const { onProgress, shouldAbort, snapshotAt = new Set(), onSnapshot, dynSampleAt = new Set(), onDynSample } = opts;
+    const { onProgress, shouldAbort, snapshotAt = new Set(), onSnapshot, dynSampleAt = new Set(), onDynSample } = opts;
   const timeLimitSec = settings.timeLimitMin * 60;
   const consumeMin = settings.consumeMinPerMin;
   const consumeMax = settings.consumeMaxPerMin;
@@ -898,11 +1129,14 @@ async function runSimulation(cities, settings, opts = {}){
         }
       }
     }
+    /* 【JS-1】用 targetIdx + isAttack 反查路線（避免索引重排失效） */
     for(let i=0;i<N;i++){
       const q = marchingOut[i];
       for(let k = q.length-1; k >= 0; k--){
         if(t >= q[k].arrivalAt){
-          const route = outbound[i][q[k].routeIdx];
+          const route = outbound[i].find(r =>
+            r.targetIdx === q[k].targetIdx && r.isAttack === q[k].isAttack
+          );
           if(route){
             route.count += q[k].teams;
             if(!route.hasArrived){
@@ -916,10 +1150,15 @@ async function runSimulation(cities, settings, opts = {}){
     }
   }
 
+  /* 【JS-1】改存 targetIdx + isAttack（穩定識別） */
   function pushMarchingOut(srcIdx, routeIdx, teams, t){
     if(teams <= 0) return;
     if(marchSec > 0){
-      marchingOut[srcIdx].push({ teams, arrivalAt: t + marchSec, routeIdx });
+      const r = outbound[srcIdx][routeIdx];
+      marchingOut[srcIdx].push({
+        teams, arrivalAt: t + marchSec,
+        targetIdx: r.targetIdx, isAttack: r.isAttack,
+      });
     } else {
       outbound[srcIdx][routeIdx].count += teams;
     }
@@ -1083,6 +1322,7 @@ async function runSimulation(cities, settings, opts = {}){
           marchingOut[dIdx].length = 0;
           for(const q of marchingBack[dIdx]){ if(cap >= 0) cooldownMapField[cap].set(t + cooldownSec[cap], (cooldownMapField[cap].get(t + cooldownSec[cap]) || 0) + q.teams); }
           marchingBack[dIdx].length = 0;
+          /* 【JS-1】這裡已用 targetIdx 篩選，正確 */
           for(let i=0;i<N;i++){
             if(i === dIdx) continue;
             const q = marchingOut[i];
@@ -1224,7 +1464,9 @@ self.onmessage = async (e) => {
 };
 `;
 
+/* 【CLEAN-3】記錄 blob URL 以便 revoke */
 let simWorker = null;
+let simWorkerUrl = null;
 let simWorkerAvailable = null;
 let simRunId = 0;
 function getWorker(){
@@ -1232,12 +1474,14 @@ function getWorker(){
   if(simWorker) return simWorker;
   try{
     const blob = new Blob([WORKER_SOURCE], {type:'application/javascript'});
-    simWorker = new Worker(URL.createObjectURL(blob));
+    simWorkerUrl = URL.createObjectURL(blob);
+    simWorker = new Worker(simWorkerUrl);
     simWorkerAvailable = true;
     console.log('%c[Worker] 已啟動', 'color:#22ff88;font-weight:bold');
     return simWorker;
   }catch(e){
     simWorkerAvailable = false; simWorker = null;
+    if(simWorkerUrl){ try{ URL.revokeObjectURL(simWorkerUrl); }catch(_){} simWorkerUrl = null; }
     console.warn('%c[Worker] 無法啟動，改用主執行緒同步模式', 'color:#ffcc00;font-weight:bold', e.message);
     return null;
   }
@@ -1447,7 +1691,6 @@ const R = (() => {
     else { cls = 'red'; label = '未連線'; }
     if(dot) dot.className = 'health-dot ' + cls;
     if(text) text.textContent = label;
-    // 聊天室頁首的連線狀態
     const cdot = document.getElementById('chatHealthDot'), ctxt = document.getElementById('chatHealthText');
     if(cdot) cdot.className = 'health-dot ' + cls;
     if(ctxt) ctxt.textContent = label;
@@ -1706,6 +1949,7 @@ const DYN = (() => {
   }
   return { init, setRows, renderTable, populateCityFilters };
 })();
+
 /* ============ 佈兵總覽 ============ */
 const DEPLOY = (() => {
   let currentView = 'attack';
@@ -1756,11 +2000,11 @@ const DEPLOY = (() => {
     return map;
   }
 
-  function getFilteredCities(){
+  /* 【CLEAN-5】接收 conflictMap 參數，避免重複計算 */
+  function getFilteredCities(conflictMap){
     const zoneId = document.getElementById('deployZone').value;
     const side = document.getElementById('deploySide').value;
     const filter = document.getElementById('deployFilter').value;
-    const conflictMap = getConflictInfo();
     let cities = state.cities.filter(c => {
       if (zoneId !== 'all' && c.zoneId !== zoneId) return false;
       if (side !== 'all' && c.side !== side) return false;
@@ -1973,7 +2217,8 @@ const DEPLOY = (() => {
       }
     }
 
-    const iterations = 300;
+    /* 【CLEAN-6】動態 iterations：節點多時降低迭代次數 */
+    const iterations = N > 50 ? 150 : 300;
     let temp = W / 8;
     const cool = temp / (iterations + 1);
 
@@ -2073,8 +2318,9 @@ const DEPLOY = (() => {
     return { pos, zones };
   }
 
+  /* 【JS-3】使用原始 side（非 sideClass），讓 common_enemy 有專屬顏色 */
   function makeNodeShape(ns, side, x, y, r){
-    const cls = 'graph-node ' + sideClass(side);
+    const cls = 'graph-node ' + side;
     let el;
     if (side === 'ally'){
       el = document.createElementNS(ns, 'rect');
@@ -2160,6 +2406,9 @@ const DEPLOY = (() => {
         rect.setAttribute('y', z.y);
         rect.setAttribute('width', z.w);
         rect.setAttribute('height', z.h);
+        /* 【SVG-1】Safari 相容：直接 setAttribute */
+        rect.setAttribute('rx', 14);
+        rect.setAttribute('ry', 14);
         zoneG.appendChild(rect);
 
         const label = document.createElementNS(ns, 'text');
@@ -2508,9 +2757,10 @@ const DEPLOY = (() => {
     `;
   }
 
+  /* 【CLEAN-5】只算一次 conflictMap */
   function render(){
     const conflictMap = getConflictInfo();
-    const cities = getFilteredCities();
+    const cities = getFilteredCities(conflictMap);
     if (currentView === 'attack') renderAttackView(cities, conflictMap);
     else if (currentView === 'defend') renderDefendView(cities, conflictMap);
     else if (currentView === 'matrix') renderMatrixView(cities, conflictMap);
@@ -2525,7 +2775,7 @@ const DEPLOY = (() => {
 
   function exportCSV(){
     const conflictMap = getConflictInfo();
-    const cities = getFilteredCities();
+    const cities = getFilteredCities(conflictMap);
     let headers, rows;
     if (currentView === 'attack'){
       headers = ['出兵城', '陣營', '總隊數', '進攻指示', '協防指示', '留守隊數', '留守%', '受兵量', '衝堂警示'];
@@ -2588,6 +2838,30 @@ const DEPLOY = (() => {
 
 /* ============ 沙盤匯出/匯入/分享 ============ */
 let pendingImportData = null;
+
+/* 【SYNC-4】本機備份（只寫一次） */
+function backupLocalBeforeJoin(){
+  try{
+    const hasData = state.alliances.length || state.zones.length || state.cities.length;
+    if(!hasData) return;
+
+    const key = LS_PREFIX + 'localBackup';
+    if(localStorage.getItem(key)){
+      logSystem('💾 已有本機備份，略過');
+      return;
+    }
+
+    const backup = {
+      backedUpAt: new Date().toISOString(),
+      settings: {...state.settings},
+      alliances: JSON.parse(JSON.stringify(state.alliances)),
+      zones: JSON.parse(JSON.stringify(state.zones)),
+      cities: JSON.parse(JSON.stringify(state.cities)),
+    };
+    localStorage.setItem(key, JSON.stringify(backup));
+    logSystem(`💾 本機資料已備份（${backup.cities.length} 座城）`);
+  }catch(e){ console.warn('備份失敗', e); }
+}
 
 function exportSandboxJSON(){
   const data = {
@@ -2846,9 +3120,11 @@ function renderTargetSelectors(attackTargets, defendTargets){
   const dMap = {}; (defendTargets || []).forEach(t => dMap[t.cityId] = t);
 
   const buildOptions = (selected) => PERCENT_OPTIONS.map(p => `<option value="${p}" ${p===selected?'selected':''}>${p}%</option>`).join('');
+  /* 【CLEAN-4】補 side */
   const myCityForAI = {
     avgPower: parseFloat(document.getElementById('cm_avgPower').value) || 1,
-    totalTeams: parseFloat(document.getElementById('cm_totalTeams').value) || 0
+    totalTeams: parseFloat(document.getElementById('cm_totalTeams').value) || 0,
+    side: document.getElementById('cm_side').value,
   };
 
   if(attackable.length === 0){ attackEl.innerHTML = `<div class="empty-hint">無可進攻目標</div>`; }
@@ -3058,6 +3334,10 @@ function saveCityFromModal(){
 
 /* ============ 模擬調度 ============ */
 function collectCitiesForSim(zoneId){ return zoneId === 'all' ? state.cities : state.cities.filter(c => c.zoneId === zoneId); }
+
+/* 【JS-2】watchdog */
+let simWatchdog = null;
+
 function executeSimulation(zoneId){
   if(state.isSimulating) return;
   const timeLimitMin = parseInt(document.getElementById('globalTimeLimit').value) || 120;
@@ -3081,6 +3361,18 @@ function executeSimulation(zoneId){
   state.dynRows = []; state.narrativeLines = [];
   document.getElementById('narrativeOutput').innerHTML = '推演中...';
   DYN.setRows([]); viz.reset(); R.renderProgress(0);
+
+  /* 【JS-2】啟動 watchdog（30 秒） */
+  clearTimeout(simWatchdog);
+  simWatchdog = setTimeout(() => {
+    if(state.isSimulating){
+      console.error('[Sim] watchdog 觸發，強制解鎖');
+      state.isSimulating = false;
+      R.renderProgress(0);
+      logSystem('❌ 推演逾時，已強制中止');
+    }
+  }, 30000);
+
   const runId = ++simRunId;
   const maxDefStartRel = Math.max(...defStartMins) - state.simBaseMin;
   const maxSec = maxDefStartRel * 60 + timeLimitMin * 60;
@@ -3099,7 +3391,7 @@ function executeSimulation(zoneId){
         case 'snapshot': viz.ingestSnapshot(msg.sec, msg.snap); break;
         case 'dyn_sample': if(msg.rows) for(const r of msg.rows) dynRowsBuffer.push(r); break;
         case 'done': worker.removeEventListener('message', onMessage); state.dynRows = dynRowsBuffer; handleSimulationDone(msg.result); break;
-        case 'error': worker.removeEventListener('message', onMessage); logSystem('❌ 推演失敗：' + msg.error); state.isSimulating = false; break;
+        case 'error': worker.removeEventListener('message', onMessage); logSystem('❌ 推演失敗：' + msg.error); state.isSimulating = false; clearTimeout(simWatchdog); break;
       }
     };
     worker.addEventListener('message', onMessage);
@@ -3117,10 +3409,12 @@ function executeSimulation(zoneId){
       });
       state.dynRows = dynRowsBuffer;
       handleSimulationDone(result);
-    }catch(err){ console.error(err); state.isSimulating = false; }
+    }catch(err){ console.error(err); state.isSimulating = false; clearTimeout(simWatchdog); }
   }, 30);
 }
 function handleSimulationDone(result){
+  /* 【JS-2】清除 watchdog */
+  clearTimeout(simWatchdog);
   R.renderProgress(1);
   setTimeout(() => R.renderProgress(0), 1000);
   if(result.aborted){ logSystem('⛔ 推演已中止'); state.isSimulating = false; return; }
@@ -3167,14 +3461,30 @@ function bindUI(){
   });
   const nameInput = document.getElementById('commanderName');
   nameInput.addEventListener('input', function(){ state.commanderName = this.value.trim(); saveState(); });
-  document.getElementById('btnCreateRoom').addEventListener('click', () => {
+
+  /* 【SYNC-2】btnCreateRoom 用 async 探測房號 */
+  document.getElementById('btnCreateRoom').addEventListener('click', async () => {
     const name = nameInput.value.trim();
     if(!name){ alert('請先填寫指揮官名稱'); return; }
+    if(!fbDb){ alert('Firebase 尚未初始化'); return; }
+
     state.commanderName = name;
-    const code = String(Math.floor(100000 + Math.random()*900000));
+
+    let code = null;
+    for(let i = 0; i < 10; i++){
+      const candidate = String(Math.floor(100000 + Math.random()*900000));
+      try{
+        const snap = await fbDb.ref(`rooms/${candidate}/presence`).once('value');
+        if(!snap.exists()){ code = candidate; break; }
+      }catch(e){ code = candidate; break; }
+    }
+    if(!code){ alert('無法生成房間碼'); return; }
+
     document.getElementById('roomCode').value = code;
-    connectFirebase(code, true); saveState();
+    connectFirebase(code, true);
+    saveState();
   });
+
   document.getElementById('btnJoinRoom').addEventListener('click', () => {
     const name = nameInput.value.trim();
     if(!name){ alert('請先填寫指揮官名稱'); return; }
@@ -3183,7 +3493,31 @@ function bindUI(){
     state.commanderName = name;
     connectFirebase(code, false); saveState();
   });
-  document.getElementById('btnDisconnect').addEventListener('click', () => showConfirm('中斷連線', '確定要中斷與盟友的連線嗎？', () => disconnectFirebase()));
+
+  /* 中斷連線 → 走 requestDisconnect（含退出房間二選一） */
+  document.getElementById('btnDisconnect').addEventListener('click', requestDisconnect);
+
+  /* 申請推送按鈕 */
+  const btnRequestPush = document.getElementById('btnRequestPush');
+  if(btnRequestPush) btnRequestPush.addEventListener('click', requestPushToRoom);
+
+  /* 房主審核按鈕 */
+  const btnApprove = document.getElementById('pushRequestApprove');
+  if(btnApprove) btnApprove.addEventListener('click', approvePush);
+  const btnReject = document.getElementById('pushRequestReject');
+  if(btnReject) btnReject.addEventListener('click', rejectPush);
+
+  /* 退出房間選項按鈕 */
+  document.querySelectorAll('[data-exit-choice]').forEach(btn => {
+    btn.addEventListener('click', function(){
+      confirmExit(this.dataset.exitChoice);
+    });
+  });
+  const exitCancel = document.getElementById('exitRoomCancel');
+  if(exitCancel) exitCancel.addEventListener('click', () => {
+    document.getElementById('exitRoomModal').classList.remove('show');
+  });
+
   document.getElementById('btnSaveSettings').addEventListener('click', () => {
     updateSettings({
       timeLimitMin: parseInt(document.getElementById('globalTimeLimit').value) || 120,
@@ -3198,7 +3532,7 @@ function bindUI(){
     alert('戰鬥參數已儲存');
   });
   document.getElementById('btnResetAll').addEventListener('click', () => {
-    showConfirm('重置所有數據', '⚠️ 這將清除所有資料！確定嗎？', () => { localStorage.removeItem(LS_PREFIX + 'state'); localStorage.removeItem(AI_LS_KEY); location.reload(); });
+    showConfirm('重置所有數據', '⚠️ 這將清除所有資料！確定嗎？', () => { localStorage.removeItem(LS_PREFIX + 'state'); localStorage.removeItem(AI_LS_KEY); localStorage.removeItem(LS_PREFIX + 'localBackup'); location.reload(); });
   });
   document.getElementById('btnAISave').addEventListener('click', function(){
     AI.setParams(readAIParamsFromUI());
@@ -3287,7 +3621,6 @@ function bindUI(){
   });
   document.getElementById('modalCancel').addEventListener('click', () => { document.getElementById('confirmModal').classList.remove('show'); confirmCb = null; });
   document.getElementById('modalConfirm').addEventListener('click', () => { document.getElementById('confirmModal').classList.remove('show'); if(confirmCb) confirmCb(); confirmCb = null; });
-  // 檔案/連結
   document.getElementById('btnExportJSON').addEventListener('click', exportSandboxJSON);
   document.getElementById('btnImportJSON').addEventListener('click', () => document.getElementById('importFileInput').click());
   document.getElementById('importFileInput').addEventListener('change', function(){
@@ -3302,7 +3635,32 @@ function bindUI(){
     document.getElementById('importModal').classList.remove('show');
     pendingImportData = null;
   });
-  // 聊天室
+
+  /* 【SYNC-7】恢復本機備份按鈕 */
+  const btnRestore = document.getElementById('btnRestoreBackup');
+  if(btnRestore){
+    btnRestore.addEventListener('click', () => {
+      const raw = localStorage.getItem(LS_PREFIX + 'localBackup');
+      if(!raw){ alert('沒有本機備份可恢復'); return; }
+      let backup;
+      try{ backup = JSON.parse(raw); }catch(e){ alert('備份檔損毀'); return; }
+      showConfirm('恢復本機備份',
+        `將本機資料換回 ${backup.backedUpAt} 的備份（${(backup.cities||[]).length} 座城）。\n目前房間資料將被覆蓋，確定嗎？`,
+        () => {
+          state.alliances = backup.alliances || [];
+          state.zones     = backup.zones     || [];
+          state.cities    = backup.cities    || [];
+          if(backup.settings) Object.assign(state.settings, backup.settings);
+          saveState();
+          R.renderAll();
+          DYN.populateCityFilters();
+          DEPLOY.populateZoneFilter();
+          logSystem('♻️ 已恢復本機備份');
+        }
+      );
+    });
+  }
+
   const chatInput = document.getElementById('chatInput');
   const btnSendChat = document.getElementById('btnSendChat');
   function doSendChat(){
@@ -3327,6 +3685,10 @@ function bindUI(){
     });
   }
   window.addEventListener('beforeunload', saveState);
+  /* 【CLEAN-3】卸載時 revoke Worker URL */
+  window.addEventListener('beforeunload', () => {
+    if(simWorkerUrl){ try{ URL.revokeObjectURL(simWorkerUrl); }catch(e){} }
+  });
   DEPLOY.init();
 }
 function bindEvents(){
@@ -3351,16 +3713,7 @@ function bindEvents(){
     if(payload.name && payload.clientId !== state.myClientId) logSystem(`⚡ ${payload.name} 啟動推演`);
     if(state.isHost){ document.getElementById('simZoneSelect').value = payload.zoneId || 'all'; executeSimulation(payload.zoneId || 'all'); }
   });
-  on(EVT.CHAT_NEW, p => {
-    addChatMessage({
-      id: uid(),
-      sender: p.sender,
-      text: p.text,
-      time: p.time || nowTime(),
-      isSelf: false,
-      isSystem: false,
-    });
-  });
+  /* 【CLEAN-1】EVT.CHAT_NEW 監聽已移除（死代碼） */
 }
 function boot(){
   loadState();
@@ -3374,6 +3727,15 @@ function boot(){
   document.getElementById('globalMaxLossRatio').value = Math.round(state.settings.maxLossRatio * 100);
   document.getElementById('globalMinLossRatio').value = Math.round(state.settings.minLossRatio * 100);
   syncAIParamsToUI();
+
+  /* 【SYNC-1】提前初始化 Firebase（供房號探測與任何早期讀取使用） */
+  try{
+    if(!fbApp){
+      fbApp = firebase.initializeApp(FIREBASE_CONFIG);
+      fbDb = firebase.database();
+    }
+  }catch(e){ console.warn('Firebase 初始化失敗', e); }
+
   registerSender(patches => {
     if(!state.connected) return;
     publish({ type:'sync_patch', clientId:state.myClientId, lamport:state.lamport, patches });
@@ -3386,16 +3748,16 @@ function boot(){
   R.renderChatBadge();
   R.renderProgress(0);
   DEPLOY.populateZoneFilter();
+  updatePushButtonState();
 
-  setTimeout(() => {
-    if (loadFromShareLink()){
-      R.renderAll();
-      DYN.populateCityFilters();
-      DEPLOY.populateZoneFilter();
-    }
-  }, 50);
+  /* 【CLEAN-7】直接呼叫，不再 setTimeout */
+  if (loadFromShareLink()){
+    R.renderAll();
+    DYN.populateCityFilters();
+    DEPLOY.populateZoneFilter();
+  }
 
-  console.log('%c[沙盤 v7.5] Firebase + 盟徽 + 聊天室 + 三佈局連線圖（就緒）', 'color:#22ff88;font-weight:bold;font-size:14px');
+  console.log('%c[沙盤 v7.6] Firebase + 盟徽 + 聊天室 + 推送申請 + 退出選擇（就緒）', 'color:#22ff88;font-weight:bold;font-size:14px');
 }
 if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
