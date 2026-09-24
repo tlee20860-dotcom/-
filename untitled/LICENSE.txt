@@ -1,6 +1,6 @@
 The MIT License (MIT)
 
-Copyright (c) 2026 Ai 01 (https://codepen.io/editor/Ai-01/pen/01a0cd2a-5153-7012-a620-b01ce4cd4947)
+Copyright (c) 2026 Ai 01 (https://codepen.io/editor/Ai-01/pen/01a0d42c-7a5d-7663-b675-b4c05efca282)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
