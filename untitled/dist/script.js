@@ -1,12 +1,12 @@
 /* ============================================================================
- * v7.4：Firebase 即時連線 + 盟徽 + 佈兵總覽（含連線圖三佈局）
+ * v7.5：Firebase 即時連線 + 盟徽 + 聊天室 + 佈兵總覽
  * ========================================================================== */
 (function(){
 'use strict';
 
-const LS_PREFIX = 'slg_sandtable_v74_';
+const LS_PREFIX = 'slg_sandtable_v75_';
 const AI_LS_KEY = 'slg_ai_params';
-const HOST_TIMEOUT = 15000;   // presence 逾時（毫秒）
+const HOST_TIMEOUT = 15000;
 const SIM_CHUNK = 500;
 const VIZ_CHUNK_SIZE = 6000;
 const VIZ_SNAPSHOT_INTERVAL = 5;
@@ -162,6 +162,8 @@ const state = {
     allianceDeleted:new Set(), zoneDeleted:new Set(), cityDeleted:new Set() },
   roomEpoch:'', simBaseMin: 0, dynRows: [], editingAllianceId: null,
   narrativeLines: [],
+  chatMessages: [],
+  unreadChat: 0,
 };
 
 const bus = new Map();
@@ -180,6 +182,7 @@ function saveState(){
       roomEpoch:state.roomEpoch, alliances:state.alliances, zones:state.zones, cities:state.cities,
       dynRows: state.dynRows.slice(-5000),
       narrativeLines: state.narrativeLines.slice(-1000),
+      chatMessages: state.chatMessages.slice(-200),
     }));
   }catch(e){ console.warn('儲存失敗', e); }
 }
@@ -228,6 +231,7 @@ function loadState(){
     });
     if(Array.isArray(d.dynRows)) state.dynRows = d.dynRows.slice(-5000);
     if(Array.isArray(d.narrativeLines)) state.narrativeLines = d.narrativeLines.slice(-1000);
+    if(Array.isArray(d.chatMessages)) state.chatMessages = d.chatMessages.slice(-200);
   }catch(e){ console.warn('讀取失敗', e); }
 }
 
@@ -422,7 +426,6 @@ function onFirebaseConnected(asHost){
   state.isHost = !!asHost;
   state.hostName = asHost ? state.commanderName : '';
 
-  // Presence
   presenceRef = fbDb.ref(`rooms/${state.roomCode}/presence/${state.myClientId}`);
   presenceRef.set({
     name: state.commanderName,
@@ -453,7 +456,6 @@ function onFirebaseConnected(asHost){
     checkHostHealthFirebase();
   });
 
-  // Events
   eventsRef = fbDb.ref(`rooms/${state.roomCode}/events`);
   const evHandler = eventsRef.limitToLast(200).on('child_added', snap => {
     const p = snap.val();
@@ -464,21 +466,34 @@ function onFirebaseConnected(asHost){
   });
   fbEventHandlers.push({ ref: eventsRef, evt:'child_added', fn: evHandler });
 
-  // Locks
   locksRef = fbDb.ref(`rooms/${state.roomCode}/locks`);
   locksRef.on('value', snap => {
     state.editLocks = snap.val() || {};
     emit(EVT.LOCKS);
   });
 
-  // Chat
+  // 聊天室
   chatRef = fbDb.ref(`rooms/${state.roomCode}/chat`);
-  const chatHandler = chatRef.limitToLast(100).on('child_added', snap => {
+  const chatHandler = chatRef.limitToLast(200).on('child_added', snap => {
     const m = snap.val();
     if(!m) return;
-    if(m._from === state.myClientId) return;
-    if(m._ts && m._ts < connectTime) return;
-    emit(EVT.CHAT_NEW, { sender:m.sender, text:m.text, time:m.time });
+    const isSelf = (m._from === state.myClientId);
+    const isSystem = !!m.isSystem;
+    addChatMessage({
+      id: snap.key,
+      sender: m.sender || '系統',
+      text: m.text,
+      time: m.time,
+      isSelf,
+      isSystem,
+    });
+    if(!isSelf && !isSystem){
+      const chatTab = document.getElementById('tab-chat');
+      if(!chatTab || !chatTab.classList.contains('active')){
+        state.unreadChat++;
+        R.renderChatBadge();
+      }
+    }
   });
   fbEventHandlers.push({ ref: chatRef, evt:'child_added', fn: chatHandler });
 
@@ -656,8 +671,67 @@ function handleIncoming(payload){
     }
   }
 }
+
+/* ============ 聊天室 ============ */
+function addChatMessage(msg){
+  if(msg.id && state.chatMessages.some(m => m.id === msg.id)) return;
+  state.chatMessages.push(msg);
+  if(state.chatMessages.length > 200) state.chatMessages = state.chatMessages.slice(-200);
+  if(typeof R !== 'undefined') { R.renderChat(); R.renderChatBadge(); }
+  saveState();
+}
+
+function sendChatMessage(text){
+  text = (text || '').trim();
+  if(!text) return;
+  if(!state.commanderName){ alert('請先設定指揮官名稱'); return; }
+  if(!isConnected()){
+    addChatMessage({
+      id: uid(),
+      sender: state.commanderName,
+      text,
+      time: nowTime(),
+      isSelf: true,
+      isSystem: false,
+    });
+    return;
+  }
+  try{
+    fbDb.ref(`rooms/${state.roomCode}/chat`).push({
+      sender: state.commanderName,
+      text,
+      time: nowTime(),
+      _from: state.myClientId,
+      _ts: Date.now(),
+    });
+  }catch(e){
+    console.warn('聊天發送失敗', e);
+    addChatMessage({
+      id: uid(),
+      sender: state.commanderName,
+      text,
+      time: nowTime(),
+      isSelf: true,
+      isSystem: false,
+    });
+  }
+}
+
+function sendSystemChat(text){
+  if(!isConnected()) return;
+  try{
+    fbDb.ref(`rooms/${state.roomCode}/chat`).push({
+      sender: '系統',
+      text: text,
+      time: nowTime(),
+      _from: state.myClientId,
+      _ts: Date.now(),
+      isSystem: true,
+    });
+  }catch(e){}
+}
 /* ============================================================
-   模擬引擎 v7.4
+   模擬引擎 v7.5
    ============================================================ */
 async function runSimulation(cities, settings, opts = {}){
   const { onProgress, shouldAbort, snapshotAt = new Set(), onSnapshot, dynSampleAt = new Set(), onDynSample } = opts;
@@ -1373,6 +1447,12 @@ const R = (() => {
     else { cls = 'red'; label = '未連線'; }
     if(dot) dot.className = 'health-dot ' + cls;
     if(text) text.textContent = label;
+    // 聊天室頁首的連線狀態
+    const cdot = document.getElementById('chatHealthDot'), ctxt = document.getElementById('chatHealthText');
+    if(cdot) cdot.className = 'health-dot ' + cls;
+    if(ctxt) ctxt.textContent = label;
+    const crd = document.getElementById('chatRoomDisplay');
+    if(crd) crd.textContent = state.roomCode ? `房間 ${state.roomCode}` : '';
   }
   function renderHost(){
     const el = document.getElementById('hostDisplay');
@@ -1499,9 +1579,38 @@ const R = (() => {
     }).join('');
     el.scrollTop = el.scrollHeight;
   }
+  function renderChat(){
+    const el = document.getElementById('chatMessages');
+    if(!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    const frag = document.createDocumentFragment();
+    for(const m of state.chatMessages){
+      const div = document.createElement('div');
+      div.className = 'msg ' + (m.isSystem ? 'system' : (m.isSelf ? 'self' : 'other'));
+      if(m.isSystem){
+        div.textContent = m.text;
+      } else {
+        div.innerHTML = `<div class="sender">${esc(m.sender)}</div><div>${esc(m.text)}</div><div class="time">${esc(m.time || '')}</div>`;
+      }
+      frag.appendChild(div);
+    }
+    el.innerHTML = '';
+    el.appendChild(frag);
+    if(atBottom) el.scrollTop = el.scrollHeight;
+  }
+  function renderChatBadge(){
+    const badge = document.getElementById('chatBadge');
+    if(!badge) return;
+    if(state.unreadChat > 0){
+      badge.textContent = state.unreadChat > 99 ? '99+' : state.unreadChat;
+      badge.classList.add('show');
+    } else {
+      badge.classList.remove('show');
+    }
+  }
   function renderProgress(p){ const bar = document.getElementById('simProgress'); if(bar) bar.style.width = Math.round(p*100) + '%'; }
-  function renderAll(){ renderHealth(); renderHost(); renderMembers(); renderAlliances(); renderZones(); renderCities(); }
-  return { renderHealth, renderHost, renderDebug, renderMembers, renderAlliances, renderMatrix, renderZones, renderCities, renderNarrative, renderProgress, renderAll };
+  function renderAll(){ renderHealth(); renderHost(); renderMembers(); renderAlliances(); renderZones(); renderCities(); renderChat(); renderChatBadge(); }
+  return { renderHealth, renderHost, renderDebug, renderMembers, renderAlliances, renderMatrix, renderZones, renderCities, renderNarrative, renderChat, renderChatBadge, renderProgress, renderAll };
 })();
 
 /* ============ DYN ============ */
@@ -2136,7 +2245,6 @@ const DEPLOY = (() => {
 
       g.appendChild(makeNodeShape(ns, c.side, pos.x, pos.y, r));
 
-      // 盟徽底盤
       if (hasIcon){
         const bg = document.createElementNS(ns, 'circle');
         bg.setAttribute('cx', pos.x);
@@ -3025,6 +3133,7 @@ function handleSimulationDone(result){
   if(state.isHost && isConnected()){
     publish({ type:'viz_payload', data: viz.getAllSnapshots() });
     publish({ type:'dyn_payload', rows: state.dynRows });
+    sendSystemChat('⚡ 推演完成');
   }
   viz.finalize();
   state.isSimulating = false;
@@ -3047,6 +3156,13 @@ function bindUI(){
       if(tabId === 'tab-viz') requestAnimationFrame(() => requestAnimationFrame(() => viz.activate()));
       if(tabId === 'tab-params') syncAIParamsToUI();
       if(tabId === 'tab-deploy'){ DEPLOY.populateZoneFilter(); DEPLOY.render(); }
+      if(tabId === 'tab-chat'){
+        state.unreadChat = 0;
+        R.renderChatBadge();
+        R.renderChat();
+        const el = document.getElementById('chatMessages');
+        if(el) el.scrollTop = el.scrollHeight;
+      }
     });
   });
   const nameInput = document.getElementById('commanderName');
@@ -3186,6 +3302,30 @@ function bindUI(){
     document.getElementById('importModal').classList.remove('show');
     pendingImportData = null;
   });
+  // 聊天室
+  const chatInput = document.getElementById('chatInput');
+  const btnSendChat = document.getElementById('btnSendChat');
+  function doSendChat(){
+    const text = chatInput.value.trim();
+    if(!text) return;
+    sendChatMessage(text);
+    chatInput.value = '';
+    chatInput.focus();
+  }
+  if(btnSendChat) btnSendChat.addEventListener('click', doSendChat);
+  if(chatInput) chatInput.addEventListener('keydown', e => { if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); doSendChat(); } });
+  const btnClearChat = document.getElementById('btnClearChat');
+  if(btnClearChat){
+    btnClearChat.addEventListener('click', () => {
+      showConfirm('清空聊天室', '確定要清空本機的聊天記錄嗎？（不影響其他人）', () => {
+        state.chatMessages = [];
+        state.unreadChat = 0;
+        R.renderChat();
+        R.renderChatBadge();
+        saveState();
+      });
+    });
+  }
   window.addEventListener('beforeunload', saveState);
   DEPLOY.init();
 }
@@ -3211,6 +3351,16 @@ function bindEvents(){
     if(payload.name && payload.clientId !== state.myClientId) logSystem(`⚡ ${payload.name} 啟動推演`);
     if(state.isHost){ document.getElementById('simZoneSelect').value = payload.zoneId || 'all'; executeSimulation(payload.zoneId || 'all'); }
   });
+  on(EVT.CHAT_NEW, p => {
+    addChatMessage({
+      id: uid(),
+      sender: p.sender,
+      text: p.text,
+      time: p.time || nowTime(),
+      isSelf: false,
+      isSystem: false,
+    });
+  });
 }
 function boot(){
   loadState();
@@ -3232,10 +3382,11 @@ function boot(){
   viz.init(); DYN.init(); resetAllianceForm(); R.renderAll();
   DYN.setRows(state.dynRows); DYN.populateCityFilters();
   R.renderNarrative(state.narrativeLines);
+  R.renderChat();
+  R.renderChatBadge();
   R.renderProgress(0);
   DEPLOY.populateZoneFilter();
 
-  // 分享連結載入（優先）
   setTimeout(() => {
     if (loadFromShareLink()){
       R.renderAll();
@@ -3244,7 +3395,7 @@ function boot(){
     }
   }, 50);
 
-  console.log('%c[沙盤 v7.4] Firebase + 盟徽 + 三佈局連線圖（就緒）', 'color:#22ff88;font-weight:bold;font-size:14px');
+  console.log('%c[沙盤 v7.5] Firebase + 盟徽 + 聊天室 + 三佈局連線圖（就緒）', 'color:#22ff88;font-weight:bold;font-size:14px');
 }
 if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
